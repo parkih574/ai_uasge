@@ -188,12 +188,32 @@ $workRoot = [System.IO.Path]::GetFullPath((Join-Path $projectDir 'work'))
 $testDir = Join-Path $workRoot ('verification-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $testDir -Force | Out-Null
 try {
+    $STATE_CACHE = Join-Path $testDir 'claude-state.json'
+    $CLAUDE_STATUS_CACHE = Join-Path $testDir 'claude-status.json'
+    $CODEX_STATE_CACHE = Join-Path $testDir 'codex-state.json'
     $cachePath = Join-Path $testDir 'usage.json'
     Set-JsonAtomic @{ account = 'a@example.invalid'; profile = 'profile-a'; updated = Get-Date; source = '합성 상태줄'; rows = $legacyRows } $cachePath
     Assert ($null -eq (Read-UsageCache $cachePath 'b@example.invalid' 'profile-a')) 'Cross-account cache leaked'
     Assert ($null -eq (Read-UsageCache $cachePath 'a@example.invalid' 'profile-b')) 'Cross-profile cache leaked'
     Assert ((Read-UsageCache $cachePath 'a@example.invalid' 'profile-a').rows.Count -eq 3) 'Matching cache lost'
     Assert ((Read-UsageCache $cachePath 'a@example.invalid' 'profile-a').source -eq '합성 상태줄') 'UTF-8 usage cache source'
+    $accountTime=(Get-Date).Date.AddHours(1)
+    $accountA=@{account='a@example.invalid';profile='profile-a';plan='Pro';source='합성 기록';updated=$accountTime;rows=@(New-UsageRow '5h' 21 $futureTime.LocalDateTime)}
+    $accountB=@{account='b@example.invalid';profile='profile-a';plan='Max';source='합성 기록';updated=$accountTime.AddMinutes(1);rows=@(New-UsageRow '5h' 74 $futureTime.LocalDateTime)}
+    Set-JsonAtomic $accountA $cachePath
+    Save-UsageCache $accountB $cachePath
+    $restoredA=Read-UsageCache $cachePath 'a@example.invalid' 'profile-a'
+    Assert ($restoredA.rows[0].pct -eq 21 -and $restoredA.plan -eq 'Pro' -and $restoredA.updated -eq $accountTime) 'Switching A to B migrates and preserves A usage, plan and original time'
+    Assert ((Read-UsageCache $cachePath 'B@example.invalid' 'profile-a').rows[0].pct -eq 74) 'Each account has its own case-insensitive record'
+    Assert ($null -eq (Read-UsageCache $cachePath 'c@example.invalid' 'profile-a') -and $null -eq (Read-UsageCache $cachePath 'a@example.invalid' 'profile-b')) 'Account history cannot leak across users or profiles'
+    $olderA=$accountA.Clone(); $olderA.updated=$accountTime.AddMinutes(-1); $olderA.rows=@(New-UsageRow '5h' 9 $null)
+    Save-UsageCache $olderA $cachePath
+    Assert ((Read-UsageCache $cachePath 'a@example.invalid' 'profile-a').rows[0].pct -eq 21) 'Late older writes cannot replace newer account history'
+    [IO.File]::WriteAllText($cachePath,'{broken')
+    Assert ((Read-UsageCache $cachePath 'b@example.invalid' 'profile-a').rows[0].pct -eq 74) 'Broken latest cache does not destroy other account records'
+    Set-JsonAtomic @{account='a@example.invalid';profile='profile-a';updated=$accountTime.AddDays(1);rows=@(@{name='5h';pct='invalid'})} $cachePath
+    Save-UsageCache $accountB $cachePath
+    Assert ((Read-UsageCache $cachePath 'b@example.invalid' 'profile-a').rows[0].pct -eq 74 -and (Read-UsageCache $cachePath 'a@example.invalid' 'profile-a').rows[0].pct -eq 21) 'Malformed legacy rows do not block valid new data or overwrite existing history'
     $ANTIGRAVITY_CACHE = Join-Path $testDir 'antigravity.json'
     $ANTIGRAVITY_STATE_CACHE = Join-Path $testDir 'antigravity-state.json'
     Set-JsonAtomic @{ plan='Pro'; account='ag@example.invalid'; rows=@(); updated=Get-Date } $ANTIGRAVITY_CACHE
@@ -301,6 +321,8 @@ try {
         Assert ($state.antigravity.plan -eq 'Current Ultra' -and $state.antigravity.rows.Count -eq 2 -and $state.antigravity.asOf -eq $lastDesktopTime) 'Live plan-only response keeps same-account last usage with its original time'
         function Get-AntigravityLocalSnapshots { return @($desktopUsage) }
         $desktopUsage.rows[0].pct=35
+        $desktopUsage.updated=(Get-Date).AddSeconds(1)
+        $lastReopenedTime=$desktopUsage.updated
         Get-AntigravityUsage
         Assert ($state.antigravity.rows[0].pct -eq 35 -and -not $state.antigravity.rows[0].stale -and -not $state.antigravity.groups[0].err) 'Reopened desktop replaces cached values and clears offline status'
         $desktopUsage.rows[0].pct=20
@@ -312,6 +334,11 @@ try {
         function Get-AntigravityLocalSnapshots { return @() }
         Get-AntigravityUsage
         Assert ($state.antigravity.account -eq 'new@example.invalid' -and $state.antigravity.plan -eq 'New Plan' -and $state.antigravity.rows.Count -eq 0) 'Closing after account switch restores only the new account metadata'
+        function Get-AntigravityLocalSnapshots { return @($metadataOnly) }
+        $state.antigravity=@{rows=@();groups=@()}
+        Get-AntigravityUsage
+        Assert ($state.antigravity.account -eq 'ag@example.invalid' -and $state.antigravity.rows[0].pct -eq 35 -and $state.antigravity.plan -eq 'Current Ultra' -and $state.antigravity.asOf -eq $lastReopenedTime) 'Returning to A after B and restart restores only A last quotas with original time'
+        function Get-AntigravityLocalSnapshots { return @() }
         [System.IO.File]::WriteAllText($ANTIGRAVITY_STATE_CACHE,'{broken')
         Get-AntigravityUsage
         Assert ($state.antigravity.clear -and $state.antigravity.rows.Count -eq 0) 'Corrupt last-state cache and obsolete CLI cache never fabricate data'
@@ -346,6 +373,10 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             @{ id=$request.id; result=@{account=@{type='chatgpt';email='codex@example.invalid';planType='pro'}} } | ConvertTo-Json -Depth 5 -Compress
         }
         'account/rateLimits/read' {
+            if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'fail-quota')) {
+                @{id=$request.id;error=@{code=-32000;message='synthetic quota failure'}} | ConvertTo-Json -Compress
+                continue
+            }
             @{ id=$request.id; result=@{rateLimitsByLimitId=@{
                 codex=@{primary=@{usedPercent=12;windowDurationMins=300}}
                 additional=@{primary=@{usedPercent=87;windowDurationMins=15}}
@@ -362,8 +393,41 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     $rpcSnapshot = Get-CodexAppServerSnapshot
     $rpcUsage = Convert-CodexSnapshot $rpcSnapshot.result $rpcSnapshot.account
     Assert ($rpcUsage.rows.Count -eq 2 -and $rpcUsage.plan -eq 'pro') 'Actual JSON-RPC process handshake'
+    [IO.File]::WriteAllText((Join-Path $testDir 'fail-quota'),'1')
+    $failedQuotaSnapshot=Get-CodexAppServerSnapshot
+    Assert ($failedQuotaSnapshot.account.email -eq 'codex@example.invalid' -and -not $failedQuotaSnapshot.unavailable -and $null -eq $failedQuotaSnapshot.result) 'Quota RPC failure retains the confirmed account for isolated history lookup'
+    Remove-Item -LiteralPath (Join-Path $testDir 'fail-quota')
     $cliAccount = Get-ClaudeAccount
     Assert ($cliAccount.loggedIn -and $cliAccount.plan -eq 'max' -and $cliAccount.account -eq 'claude@example.invalid') 'Claude auth status process'
+
+    # CLI 등록은 예전 경로를 교체하고 해제 시 등록 항목만 지운다. 실사용 설정에는 접근하지 않는다.
+    foreach ($provider in 'claude', 'antigravity') {
+        $integrationSettings=Join-Path $testDir ($provider + '-settings.json')
+        $callback=Join-Path $projectDir ($provider + '-statusline.ps1')
+        $oldCallback="C:\old install\$provider-statusline.ps1"
+        foreach ($oldCommand in @((Get-StatusLineCommand $oldCallback), "powershell.exe -File `"$oldCallback`"")) {
+            Set-JsonAtomic @{theme='keep';custom=@{value=42};statusLine=@{type='command';command=$oldCommand;obsolete='remove'}} $integrationSettings
+            Assert (Test-UsageStatusLineCommand $oldCommand ([IO.Path]::GetFileName($callback))) 'Recognize previous encoded and plain registration paths'
+            Assert (Write-UsageStatusLineSettings $integrationSettings $callback ($provider -eq 'claude')) 'Register current callback'
+            $installed=Get-Content -LiteralPath $integrationSettings -Raw | ConvertFrom-Json
+            Assert ($installed.statusLine.command -eq (Get-StatusLineCommand $callback) -and -not $installed.statusLine.obsolete -and $installed.theme -eq 'keep' -and $installed.custom.value -eq 42) 'Replace old registration without changing other settings'
+            if ($provider -eq 'antigravity') { Assert ($installed.statusLine.enabled -and $installed.statusLine.stack_with_default) 'Antigravity registration enables the callback alongside its default status line' }
+            Assert (Write-UsageStatusLineSettings $integrationSettings $callback ($provider -eq 'claude') -Remove) 'Remove current callback registration'
+            $removed=Get-Content -LiteralPath $integrationSettings -Raw | ConvertFrom-Json
+            Assert (-not (Test-Field $removed 'statusLine') -and $removed.custom.value -eq 42) 'Disconnect deletes the registered path and retains unrelated settings'
+            Assert (-not (Write-UsageStatusLineSettings $integrationSettings $callback ($provider -eq 'claude') -Remove)) 'Repeated disconnect is a no-op'
+            Set-JsonAtomic @{statusLine=@{command=$oldCommand}} $integrationSettings
+            Assert (Write-UsageStatusLineSettings $integrationSettings $oldCallback ($provider -eq 'claude') -Remove) 'Old paths can be disconnected even when the callback file no longer exists'
+        }
+        Set-JsonAtomic @{statusLine=@{command='unrelated-custom-status.exe'};theme='keep'} $integrationSettings
+        $beforeUnrelated=[IO.File]::ReadAllText($integrationSettings)
+        Assert (-not (Write-UsageStatusLineSettings $integrationSettings $callback ($provider -eq 'claude') -Remove) -and [IO.File]::ReadAllText($integrationSettings) -eq $beforeUnrelated) 'Disconnect preserves a status line owned by another tool'
+        [IO.File]::WriteAllText($integrationSettings,'{broken')
+        Assert-Rejected { Write-UsageStatusLineSettings $integrationSettings $callback ($provider -eq 'claude') } 'Invalid settings refuse registration'
+        Assert ([IO.File]::ReadAllText($integrationSettings) -eq '{broken') 'Invalid settings are not overwritten'
+        Assert (@(Get-ChildItem -LiteralPath $testDir -Filter ($provider + '-settings.json.ai-usage-tray.*.bak')).Count -ge 6) 'Original settings are backed up before registration changes'
+    }
+    Assert (-not (Write-UsageStatusLineSettings (Join-Path $testDir 'missing-settings.json') $callback $false -Remove)) 'Disconnect does not create a missing settings file'
 
     # 상태줄 입력은 공백·작은따옴표가 포함된 설치 경로에서도 그대로 전달되어야 한다.
     $echoScript = Join-Path $testDir "echo ' quoted path.ps1"
@@ -406,10 +470,51 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             $writtenUsage = $writtenJson | ConvertFrom-Json
             Assert ($writtenUsage.rows.Count -eq 1 -and $writtenUsage.plan -and $writtenUsage.account) 'Real callback missing plan/account/usage'
             Assert ($writtenJson -notmatch 'not-for-cache') 'Callback cached unrelated session data'
+            $archivedUsage=Read-UsageCache $writtenPath $writtenUsage.account ([string]$writtenUsage.profile)
+            Assert ($archivedUsage.rows.Count -eq 1 -and (Test-Path -LiteralPath (Get-AccountCachePath $writtenPath $writtenUsage.account ([string]$writtenUsage.profile)))) 'Real status line callback also writes account-specific history'
         } finally { Stop-ProviderProcess $callbackProcess }
     }
 
     # 실계정 접근은 금지: 아래 실패/계정 전환 검사는 모든 외부 경로를 대체한다.
+    function Get-ClaudeCredPath { return $null }
+    $accountA.profile=Get-ClaudeProfile
+    Save-UsageCache $accountA $CLAUDE_STATUS_CACHE
+    $accountB.profile=Get-ClaudeProfile
+    Save-UsageCache $accountB $CLAUDE_STATUS_CACHE
+    function Get-ClaudeAccount { return [pscustomobject]@{loggedIn=$true;account='a@example.invalid';plan='';authMethod='oauth'} }
+    $state.claude=@{rows=@()}
+    Get-ClaudeUsage
+    Assert ($state.claude.success -and $state.claude.rows[0].pct -eq 21 -and $state.claude.plan -eq 'Pro' -and $state.claude.updated -eq $accountTime -and $state.claude.rows[0].cached) 'Claude A-B-A restores A history after restart without credentials or fresh quota'
+    function Get-ClaudeAccount { return [pscustomobject]@{loggedIn=$true;account='c@example.invalid';plan='Pro';authMethod='oauth'} }
+    $state.claude=@{rows=@()}
+    Get-ClaudeUsage
+    Assert ($state.claude.clear -and -not $state.claude.rows.Count) 'An unknown Claude account never displays saved A or B usage'
+
+    $realCodexSnapshot=${function:Get-CodexAppServerSnapshot}
+    try {
+        $script:fakeCodexEmail='a@example.invalid'; $script:fakeCodexPct=22; $script:fakeCodexFailure=$false
+        function Get-CodexAppServerSnapshot {
+            return [pscustomobject]@{
+                account=@{type='chatgpt';email=$script:fakeCodexEmail;planType='pro'};unavailable=$false;asOf=$accountTime
+                result=$(if ($script:fakeCodexFailure) { $null } else { @{rateLimits=@{primary=@{usedPercent=$script:fakeCodexPct;windowDurationMins=300;resetsAt=$futureTime.ToUnixTimeSeconds()}}} })
+            }
+        }
+        $state.gpt=@{rows=@()}
+        Get-CodexUsage
+        $script:fakeCodexEmail='b@example.invalid'; $script:fakeCodexPct=81
+        Get-CodexUsage
+        $script:fakeCodexEmail='a@example.invalid'; $script:fakeCodexFailure=$true
+        $state.gpt=@{rows=@()}
+        Get-CodexUsage
+        Assert ($state.gpt.success -and $state.gpt.account -eq 'a@example.invalid' -and $state.gpt.rows[0].pct -eq 22 -and $state.gpt.rows[0].cached -and $state.gpt.asOf -eq $accountTime) 'Codex A-B-A restores confirmed account history on quota failure after restart'
+        $roundTripCached=Convert-StoredUsageRow ($state.gpt.rows[0] | ConvertTo-Json | ConvertFrom-Json)
+        Assert ($roundTripCached.cached -and $roundTripCached.reset -and -not $roundTripCached.stale) 'Cached history preserves its reset time and no-alert flag across worker serialization'
+        $script:fakeCodexEmail='c@example.invalid'
+        $state.gpt=@{rows=@()}
+        Get-CodexUsage
+        Assert ($state.gpt.clear -and -not $state.gpt.rows.Count) 'Confirmed unknown Codex account cannot inherit another account or anonymous logs'
+    } finally { Set-Item Function:\Get-CodexAppServerSnapshot -Value $realCodexSnapshot }
+
     function Get-ClaudeAccount { return [pscustomobject]@{ loggedIn=$false; account=''; plan=''; authMethod='' } }
     function Get-ClaudeCredPath { throw 'Real credentials must not be accessed' }
     Get-ClaudeUsage
@@ -464,12 +569,22 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         }
     }
     . ([scriptblock]::Create($source.Substring($uiStart, $uiEnd - $uiStart).Replace('$PSScriptRoot', '$projectDir')))
+    $beforeForecastState=$state.claude
+    $state.claude=@{account='a@example.invalid';rows=@()}
+    $script:claudeSamples=@(@{t=(Get-Date).AddMinutes(-20);pct=10;reset=$futureTime.LocalDateTime.ToString('s')})
+    Merge-CollectionResult (@{state=@{claude=@{}};claude429Count=0} | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+    Assert ($script:claudeSamples.Count -eq 1) 'A worker that did not collect Claude does not discard its forecast samples'
+    Merge-CollectionResult (@{state=@{claude=@{success=$true;account='b@example.invalid';rows=@(New-UsageRow '5h' 20 $futureTime.LocalDateTime);updated=Get-Date}};claude429Count=0} | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+    Assert ($script:claudeSamples.Count -eq 1 -and $script:claudeSamples[0].pct -eq 20) 'Changing account starts a new forecast rather than mixing A and B samples'
+    $state.claude=$beforeForecastState; $script:claudeSamples=@()
+    $popupTestArea=[System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $popupTestArea.X=-20000; $popupTestArea.Y=-20000
     $state.claude = @{ plan='Max 20x'; account='claude@example.invalid'; source='Claude Code 상태줄'; rows=$legacyRows; err=$null; updated=Get-Date }
     $state.gpt = @{ plan='Business'; account='codex@example.invalid'; source='Codex CLI/데스크톱 앱 서버'; rows=$selectionUsage.rows; err=$null; asOf=Get-Date }
     $state.antigravity = $separateAgState
     $showClaude = [pscustomobject]@{Checked=$true}; $showGpt = [pscustomobject]@{Checked=$true}; $showAntigravity = [pscustomobject]@{Checked=$true}
     $script:usageVisibility=@{}
-    Build-Popup
+    Build-Popup $popupTestArea
     Assert ($form.Height -le [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height) 'Popup exceeds screen'
     $bitmap = [System.Drawing.Bitmap]::new($popupBody.AutoScrollMinSize.Width, $popupBody.AutoScrollMinSize.Height)
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -480,7 +595,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
     $heightWithSpark=$popupBody.AutoScrollMinSize.Height
     $script:usageVisibility=@{'codex.spark.5h'=$false;'codex.spark.weekly'=$false}
-    Build-Popup
+    Build-Popup $popupTestArea
     Assert ($popupBody.AutoScrollMinSize.Height -eq $heightWithSpark - 60) 'Spark choices remove both visible rows'
     # 실제 알림 경로도 같은 표시 필터를 사용한다.
     $showClaude.Checked=$false; $showAntigravity.Checked=$false
@@ -504,6 +619,10 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     Update-TrayIcon
     Assert ($notify.Text -match 'weekly' -and $notify.Text -notmatch '5h') 'Pro tooltip uses selected weekly instead of hidden base 5h'
     $state.gpt.plan='plus'
+    $baseRow.cached=$true
+    Test-UsageAlert
+    Assert ($script:balloons -eq 1) 'Restored account history cannot trigger a fresh usage alert'
+    $baseRow.cached=$false
     Test-UsageAlert
     Assert ($script:balloons -eq 2) 'Plus base 5h alerts when selected'
     Update-TrayIcon
@@ -560,6 +679,20 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         try { Assert ($fallbackDialog.Tag.Models.ContainsKey('gemini-new')) 'Periodless Gemini fallback retains an available model control' }
         finally { $fallbackDialog.Dispose(); $state.antigravity.rows=$knownAgRows }
         $settingsDialog=New-SettingsDialog
+        $realIntegrationAction=${function:Set-UsageStatusLine}; $realIntegrationHelp=${function:Show-UsageStatusLineHelp}
+        try {
+            $script:integrationClicks=@(); $script:helpClicks=0
+            function Set-UsageStatusLine { param($provider,[switch]$Remove,$Owner); $script:integrationClicks += "$provider/$([bool]$Remove)" }
+            function Show-UsageStatusLineHelp { param($owner); $script:helpClicks++ }
+            $clickMethod=[System.Windows.Forms.Button].GetMethod('OnClick',[System.Reflection.BindingFlags]'NonPublic,Instance')
+            foreach ($button in $settingsDialog.Tag.CliButtons) { $clickMethod.Invoke($button,@([EventArgs]::Empty)) }
+            $clickMethod.Invoke($settingsDialog.Tag.CliHelp,@([EventArgs]::Empty))
+            Assert (($script:integrationClicks -join '|') -eq 'Claude/False|Claude/True|Antigravity/False|Antigravity/True') 'Each integration button routes its own provider and setup or disconnect action'
+            Assert ($script:helpClicks -eq 1 -and $settingsDialog.Tag.CliHelp.AccessibleName -eq 'CLI 연동 도움말' -and $settingsDialog.Tag.CliHelp.TabStop) 'Question button opens accessible CLI help'
+        } finally {
+            Set-Item Function:\Set-UsageStatusLine -Value $realIntegrationAction
+            Set-Item Function:\Show-UsageStatusLineHelp -Value $realIntegrationHelp
+        }
         Assert ($settingsDialog.Font.SizeInPoints -eq 12 -and $settingsDialog.Font.Name -eq 'Pretendard Medium' -and -not $settingsDialog.Font.Bold) 'Settings use the actual medium font family, separate from bold headings'
         Assert ($settingsDialog.Icon.Size.Width -eq 32 -and $settingsDialog.Icon.Handle -ne [System.Drawing.SystemIcons]::Application.Handle) 'Settings use the custom U icon instead of the default application icon'
         # 글꼴 속성만으로 통과시키지 않는다. 실제 글자 가장자리에 회색조가 있는지 검사한다.
@@ -585,7 +718,14 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         Assert ($settingsDialog.Tag.UsageItems.Count -eq 10 -and $settingsDialog.Tag.Models.Count -eq 0) 'Settings contain the requested ten company/model/window choices without duplicate Antigravity groups'
         Assert (($settingsDialog.Tag.Checks.claude.Text,$settingsDialog.Tag.Checks.gpt.Text,$settingsDialog.Tag.Checks.antigravity.Text -join '|') -eq 'Claude|Codex|Antigravity') 'Provider headings control company visibility'
         Assert (-not $settingsDialog.Tag.UsageItems['codex.spark.5h'].Checked -and -not $settingsDialog.Tag.UsageItems['codex.spark.weekly'].Checked) 'Settings restore both Spark choices'
-        Assert ($settingsDialog.Tag.UsageItems['codex.5h'].Checked -and -not $settingsDialog.Tag.UsageItems['codex.5h'].Enabled -and $settingsDialog.Tag.UsageItems['codex.5h'].Text -match 'Pro') 'Pro base 5h explains automatic hiding while retaining saved selection'
+        Assert ($settingsDialog.Tag.UsageItems['codex.5h'].Checked -and -not $settingsDialog.Tag.UsageItems['codex.5h'].Enabled -and $settingsDialog.Tag.UsageItems['codex.5h'].AccessibleDescription -match 'Pro') 'Pro base 5h explains automatic hiding while retaining saved selection'
+        Assert ($settingsDialog.Tag.UsageItems['codex.5h'].Parent.Tag.NameCell.Controls[1].Text -eq 'Pro · 5h 숨김') 'Pro hiding remains visible beside the model label'
+        $toggle=$settingsDialog.Tag.Checks.startup
+        $toggle.Checked=$false
+        $onClick=[System.Windows.Forms.CheckBox].GetMethod('OnClick',[System.Reflection.BindingFlags]'NonPublic,Instance')
+        $onClick.Invoke($toggle,@([EventArgs]::Empty))
+        Assert ($toggle.Checked -and (($toggle.AccessibilityObject.State -band [System.Windows.Forms.AccessibleStates]::Checked) -ne 0)) 'Toggle preserves native activation and checked accessibility state'
+        $toggle.Checked=$false
         $savedBefore=[System.IO.File]::ReadAllText($DISPLAY_STATE)
         $settingsDialog.Tag.UsageItems['antigravity.gemini.5h'].Checked=$false
         $settingsDialog.Tag.Checks.startup.Checked=$true
@@ -596,17 +736,34 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         $settingsDialog.StartPosition='Manual'; $settingsDialog.Location=[System.Drawing.Point]::new(-20000,-20000)
         $settingsDialog.Show()
         [System.Windows.Forms.Application]::DoEvents()
+        Assert ($settingsDialog.BackColor.ToArgb() -eq [System.Drawing.Color]::White.ToArgb()) 'Settings background is white'
+        Assert ([Win32.Native]::SendMessage($settingsDialog.Handle,0x7F,[IntPtr]::new(1),[IntPtr]::Zero) -eq $settingsDialog.Tag.TaskbarIcon.Handle) 'Large window icon uses the taskbar U'
+        Assert ([Win32.Native]::SendMessage($settingsDialog.Handle,0x7F,[IntPtr]::Zero,[IntPtr]::Zero) -eq $settingsDialog.Tag.CaptionIcon.Handle) 'Small caption icon remains separate from the taskbar U'
+        foreach ($kind in 'Taskbar','Caption') {
+            $iconBitmap=$settingsDialog.Tag[$kind+'Icon'].ToBitmap()
+            try {
+                $solidPixels=0
+                for ($x=0; $x -lt $iconBitmap.Width; $x++) { for ($y=0; $y -lt $iconBitmap.Height; $y++) {
+                    $pixel=$iconBitmap.GetPixel($x,$y)
+                    if ($pixel.A -eq 255) {
+                        $solidPixels++
+                        Assert (($kind -eq 'Taskbar' -and $pixel.R -eq 255 -and $pixel.G -eq 255 -and $pixel.B -eq 255) -or ($kind -eq 'Caption' -and $pixel.R -lt 80 -and $pixel.G -lt 80 -and $pixel.B -lt 80)) "Settings $kind icon has the requested color"
+                    }
+                } }
+                Assert ($solidPixels -gt 20) "Settings $kind icon contains a visible U"
+            } finally { $iconBitmap.Dispose() }
+        }
         $settingsContent=$settingsDialog.Controls | Where-Object { $_ -is [System.Windows.Forms.FlowLayoutPanel] -and $_.Dock -eq 'Fill' }
         $defaultSize=$settingsDialog.Size
         $settingsDialog.Size=$settingsDialog.MinimumSize
         [System.Windows.Forms.Application]::DoEvents()
-        Assert ($settingsContent.VerticalScroll.Visible) 'Small settings window scrolls while completion stays available'
+        Assert ($settingsContent.VerticalScroll.Visible) "Small settings window scrolls while completion stays available: dialog=$($settingsDialog.Size), content=$($settingsContent.ClientSize), display=$($settingsContent.DisplayRectangle), last=$($settingsContent.Controls[$settingsContent.Controls.Count-1].Bounds), footer=$($settingsDialog.Tag.Footer.Bounds)"
         Assert ($settingsDialog.AcceptButton.Bottom -le $settingsDialog.AcceptButton.Parent.ClientSize.Height) 'Completion button remains inside fixed footer'
         Assert ($settingsContent.FlowDirection -eq 'TopDown' -and -not $settingsContent.WrapContents) 'Settings keep a single column at minimum size'
         $settingsDialog.Size=$defaultSize
         [System.Windows.Forms.Application]::DoEvents()
         foreach ($viewport in @(
-            @{name='preview';width=1280;height=720},
+            @{name='preview';width=1280;height=900},
             @{name='compact';width=800;height=600},
             @{name='narrow';width=500;height=500}
         )) {
@@ -616,6 +773,9 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             [System.Windows.Forms.Application]::DoEvents()
             Assert ($area.Contains($settingsDialog.Bounds)) "Settings fit $($viewport.width)x$($viewport.height) working area: $($settingsDialog.Bounds), DPI=$($settingsDialog.DeviceDpi)"
             Assert (-not $settingsContent.HorizontalScroll.Visible) "Settings avoid horizontal scrolling in $($viewport.name) layout"
+            if ($viewport.name -eq 'preview') {
+                Assert (-not $settingsContent.VerticalScroll.Visible -and $settingsDialog.Height -gt 680 * $screenScale) 'Settings grow taller to keep comfortable rows and show everything when the working area allows it'
+            }
             Assert ($settingsContent.FlowDirection -eq 'TopDown' -and -not $settingsContent.WrapContents) "Settings always use one column in $($viewport.name) layout"
             $previousBottom=[int]::MinValue
             foreach ($control in $settingsContent.Controls) {
@@ -624,26 +784,66 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             }
             Assert ($settingsDialog.AcceptButton.Bottom -le $settingsDialog.AcceptButton.Parent.ClientSize.Height -and $settingsDialog.AcceptButton.Left -ge 0) 'Completion button stays in the footer at each screen size'
             Assert ($settingsDialog.Font.SizeInPoints -eq 12) 'Smaller screens do not shrink settings text'
-            foreach ($usageRow in @($settingsContent.Controls | Where-Object { $_ -is [System.Windows.Forms.FlowLayoutPanel] })) {
-                $rowLabel=$usageRow.Controls[0]
+            $paintControls=@($settingsDialog.Tag.Checks.Values) + @($settingsDialog.Tag.UsageItems.Values) + @($settingsDialog.AcceptButton,$settingsDialog.CancelButton,$settingsDialog.Tag.CliHelp) + @($settingsDialog.Tag.CliButtons)
+            foreach ($paintControl in $paintControls) {
+                $paintBitmap=[System.Drawing.Bitmap]::new($paintControl.Width,$paintControl.Height)
+                $paintBitmap.SetResolution(96 * $screenScale,96 * $screenScale)
+                $paintGraphics=[System.Drawing.Graphics]::FromImage($paintBitmap)
+                $paintEvent=[System.Windows.Forms.PaintEventArgs]::new($paintGraphics,$paintControl.ClientRectangle)
+                try {
+                    # WM_PAINT의 불투명 버퍼처럼 부모 배경 없이 그린다. DrawToBitmap만으로는 누락된 배경을 잡지 못한다.
+                    $paintGraphics.Clear([System.Drawing.Color]::Magenta)
+                    $paintMethod=$paintControl.GetType().GetMethod('OnPaint',[System.Reflection.BindingFlags]'NonPublic,Instance')
+                    $paintMethod.Invoke($paintControl,@($paintEvent))
+                    Assert ($paintBitmap.GetPixel(0,0).ToArgb() -eq [System.Drawing.Color]::White.ToArgb()) "Opaque custom control paints its own white background: $($paintControl.Text)"
+                    if ($paintControl -is [TraySettings.CheckBox]) {
+                        $textSize=$paintGraphics.MeasureString($paintControl.Text,$paintControl.Font)
+                        Assert ($paintControl.Height -ge 35 * $screenScale -and $paintControl.Height - $textSize.Height -ge 8 * $screenScale) "Toggle row keeps vertical breathing room at screen DPI: $($paintControl.Text)"
+                        Assert ($paintControl.Width - 50 * $screenScale -ge $textSize.Width) "Text stays clear of its toggle at screen DPI: $($paintControl.Text)"
+                        Assert ($paintControl.ForeColor.ToArgb() -eq [System.Drawing.Color]::Black.ToArgb()) 'Settings toggle labels use uniform black text'
+                    }
+                } finally { $paintEvent.Dispose(); $paintGraphics.Dispose(); $paintBitmap.Dispose() }
+            }
+            foreach ($usageRow in @($settingsContent.Controls | Where-Object { $_ -is [System.Windows.Forms.TableLayoutPanel] })) {
+                $rowLabel=$usageRow.Tag.NameLabel
                 $labelGraphics=$rowLabel.CreateGraphics()
                 try { Assert ($rowLabel.Width -ge $labelGraphics.MeasureString($rowLabel.Text,$rowLabel.Font).Width) "Model label stays complete at current DPI: $($rowLabel.Text)" }
                 finally { $labelGraphics.Dispose() }
+                foreach ($namePart in $usageRow.Tag.NameCell.Controls) {
+                    Assert ($namePart.Right -le $usageRow.Tag.NameCell.ClientSize.Width -and $namePart.Bottom -le $usageRow.Tag.NameCell.ClientSize.Height) "Model label and Pro badge fit in $($viewport.name) layout: $($namePart.Text)"
+                }
+            }
+            foreach ($button in $settingsDialog.Tag.CliButtons) {
+                $buttonGraphics=$button.CreateGraphics()
+                try { Assert ($button.Width - 8 * $screenScale -ge $buttonGraphics.MeasureString($button.Text,$button.Font).Width) 'CLI button labels fit at screen DPI' }
+                finally { $buttonGraphics.Dispose() }
+                Assert ($button.Right -le $button.Parent.ClientSize.Width -and $button.Bottom -le $button.Parent.ClientSize.Height) 'CLI actions remain inside their row'
+                $providerLabel=$button.Parent.Parent.Controls | Where-Object { $_ -is [TraySettings.Label] }
+                $labelGraphics=$providerLabel.CreateGraphics()
+                try { Assert ($providerLabel.Width -ge $labelGraphics.MeasureString($providerLabel.Text,$providerLabel.Font).Width) 'CLI provider label stays clear of both buttons' }
+                finally { $labelGraphics.Dispose() }
             }
             $settingsBitmap=[System.Drawing.Bitmap]::new($settingsDialog.Width,$settingsDialog.Height)
+            $settingsBitmap.SetResolution(96 * $screenScale,96 * $screenScale)
             try {
                 $settingsDialog.DrawToBitmap($settingsBitmap,[System.Drawing.Rectangle]::new(0,0,$settingsBitmap.Width,$settingsBitmap.Height))
                 $settingsBitmap.Save((Join-Path $workRoot "settings-$($viewport.name)-$($PSVersionTable.PSVersion.Major).png"))
+                $settingsContent.ScrollControlIntoView($settingsContent.Controls[$settingsContent.Controls.Count-1])
+                if ($settingsContent.VerticalScroll.Visible) { $settingsContent.AutoScrollPosition=[System.Drawing.Point]::new(0,$settingsContent.DisplayRectangle.Height) }
+                [System.Windows.Forms.Application]::DoEvents()
+                Assert ($settingsContent.Controls[$settingsContent.Controls.Count-1].Bottom -le $settingsContent.ClientSize.Height) 'Bottom CLI action remains fully visible at the end of the scroll range'
+                $settingsDialog.DrawToBitmap($settingsBitmap,[System.Drawing.Rectangle]::new(0,0,$settingsBitmap.Width,$settingsBitmap.Height))
+                $settingsBitmap.Save((Join-Path $workRoot "settings-cli-$($viewport.name)-$($PSVersionTable.PSVersion.Major).png"))
             } finally { $settingsBitmap.Dispose() }
         }
-        Build-Popup
+        Build-Popup $popupTestArea
         $heightWithAllAgModels=$popupBody.AutoScrollMinSize.Height
         $settingsDialog.Tag.UsageItems['antigravity.gemini.5h'].Checked=$false
         $settingsDialog.Tag.Checks.startup.Checked=$true
         $settingsDialog.AcceptButton.PerformClick()
         Assert ($script:restartCount -eq 1 -and $settingsDialog.Tag.RestartReady -and $script:syntheticStartup) 'Done saves startup and requests one restart'
         Initialize-DisplayState
-        Build-Popup
+        Build-Popup $popupTestArea
         Assert ($popupBody.AutoScrollMinSize.Height -eq $heightWithAllAgModels - 30) 'Saved Gemini 5h choice hides only its popup row after restart'
         $savedModelState=Get-Content -LiteralPath $DISPLAY_STATE -Encoding UTF8 -Raw | ConvertFrom-Json
         Assert ($savedModelState.usageItems.'antigravity.gemini.5h' -eq $false -and $savedModelState.usageItems.'antigravity.gemini.weekly' -and -not $savedModelState.usageItems.'codex.spark.weekly') 'Done persists independent model periods and Spark preferences'
@@ -700,7 +900,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             return $testDialog
         }
         $script:settingsShownCount=0
-        Build-Popup
+        Build-Popup $popupTestArea
         $form.Location=[System.Drawing.Point]::new(-20000,-20000)
         $form.Show()
         [System.Windows.Forms.Application]::DoEvents()
@@ -719,17 +919,23 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         gpt=@{};antigravity=@{}
     }
     $showGpt.Checked=$false; $showAntigravity.Checked=$false
-    Build-Popup
+    Build-Popup $popupTestArea
     $form.Location=[System.Drawing.Point]::new(-20000,-20000)
     $form.Show()
     [System.Windows.Forms.Application]::DoEvents()
-    Assert ($form.Height -eq $popupBody.AutoScrollMinSize.Height + 20 -and $popupBody.Bottom -eq $form.ClientSize.Height - 1) 'Gear adds no separate row or footer height to the usage popup'
+    Assert ($form.Height -eq $popupBody.AutoScrollMinSize.Height + $form.Padding.Vertical -and $popupBody.Bottom -eq $form.ClientSize.Height - 1) "Usage popup adds only its border below the compact content: form=$($form.Size), content=$($popupBody.AutoScrollMinSize), body=$($popupBody.ClientSize), horizontal=$($popupBody.HorizontalScroll.Visible), vertical=$($popupBody.VerticalScroll.Visible)"
     Assert ($popupSettings.Parent -eq $popupBody -and $popupSettings.Top -eq 8 -and $popupSettings.Right -eq $popupBody.ClientSize.Width - 8) 'Gear shares the first model title line at the top right'
     $popupBitmap=[System.Drawing.Bitmap]::new($form.Width,$form.Height)
     try {
         $form.DrawToBitmap($popupBitmap,[System.Drawing.Rectangle]::new(0,0,$form.Width,$form.Height))
         $popupBitmap.Save((Join-Path $workRoot "usage-settings-button-$($PSVersionTable.PSVersion.Major).png"))
     } finally { $popupBitmap.Dispose(); $form.Hide() }
+    $state.claude.rows[0].warn='긴 예측 문구 ' * 100
+    Build-Popup $popupTestArea
+    Assert ($popupBody.HorizontalScroll.Visible -and $popupBody.ClientSize.Height -ge $popupBody.AutoScrollMinSize.Height) 'Horizontal scrollbar leaves the final usage row fully visible without permanent bottom padding'
+    Assert ($popupTestArea.Contains($form.Bounds) -and $form.Right -eq $popupTestArea.Right - 8 -and $form.Bottom -eq $popupTestArea.Bottom - 8) 'Popup stays anchored inside its monitor when loading widens the content'
+    $state.claude.rows[0].warn=$null
+    Build-Popup $popupTestArea
     $sampleBitmap=[System.Drawing.Bitmap]::new($popupBody.AutoScrollMinSize.Width,$popupBody.AutoScrollMinSize.Height)
     $sampleGraphics=[System.Drawing.Graphics]::FromImage($sampleBitmap)
     try {
@@ -749,14 +955,15 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         $showGpt.Checked=$true; $showAntigravity.Checked=$true
     }
     $state.antigravity.groups[0].rows = @(1..40 | ForEach-Object { New-UsageRow "Model $_" 37 $null })
-    Build-Popup
+    Build-Popup $popupTestArea
     Assert ($popupBody.AutoScrollMinSize.Height -gt $popupBody.Height) 'Many quotas must scroll'
+    Assert ($popupTestArea.Contains($form.Bounds) -and $form.Right -eq $popupTestArea.Right - 8 -and $form.Bottom -eq $popupTestArea.Bottom - 8) 'Popup stays inside its monitor when loading adds many rows'
     $form.Show()
     [System.Windows.Forms.Application]::DoEvents()
     $gearBounds=$popupSettings.RectangleToScreen($popupSettings.ClientRectangle)
     $popupBody.AutoScrollPosition=[System.Drawing.Point]::new(0,$popupBody.AutoScrollMinSize.Height)
     [System.Windows.Forms.Application]::DoEvents()
-    Build-Popup
+    Build-Popup $popupTestArea
     Assert ($popupBody.AutoScrollPosition.Y -lt 0 -and $popupSettings.Top - $popupBody.AutoScrollPosition.Y -eq 8) 'Gear scrolls with its first model title instead of covering quota rows'
     $popupBody.AutoScrollPosition=[System.Drawing.Point]::Empty
     [System.Windows.Forms.Application]::DoEvents()
@@ -782,7 +989,18 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     Test-UsageAlert
     Assert ($script:balloons -eq $beforeOfflineAlert) 'Restored offline desktop quota above 90 percent must not notify'
     $notify.Visible=$false
-    Build-Popup
+    Build-Popup $popupTestArea
+    $cachedPopupHeight=$popupBody.AutoScrollMinSize.Height
+    $cachedGroup=$state.antigravity.groups[0]
+    $cachedError=$cachedGroup.err; $cachedUpdated=$cachedGroup.updated
+    $cachedGroup.err=$null
+    Build-Popup $popupTestArea
+    Assert ($popupBody.AutoScrollMinSize.Height -eq $cachedPopupHeight) 'Cached usage with a timestamp renders without the missing-server notice or its blank space'
+    $cachedGroup.err=$cachedError; $cachedGroup.updated=$null
+    Build-Popup $popupTestArea
+    Assert ($popupBody.AutoScrollMinSize.Height -gt $cachedPopupHeight) 'Missing-server diagnostic stays visible when no last-query timestamp is available'
+    $cachedGroup.updated=$cachedUpdated
+    Build-Popup $popupTestArea
     $offlineBitmap=[System.Drawing.Bitmap]::new($popupBody.AutoScrollMinSize.Width,$popupBody.AutoScrollMinSize.Height)
     $offlineGraphics=[System.Drawing.Graphics]::FromImage($offlineBitmap)
     try {
@@ -797,7 +1015,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     if ($script:prevIconHandle -ne [IntPtr]::Zero) { [Win32.Native]::DestroyIcon($script:prevIconHandle) | Out-Null }
     if ($script:prevIcon) { $script:prevIcon.Dispose() }
     foreach ($brush in $script:brushCache.Values) { $brush.Dispose() }
-    foreach ($font in @($fontBase,$fontBold,$fontSmall,$fontSettings,$fontSettingsHeading)) { $font.Dispose() }
+    foreach ($font in @($fontBase,$fontBold,$fontSmall,$fontSettings,$fontSettingsHeading,$fontSettingsSmall)) { $font.Dispose() }
     $script:pfc.Dispose()
 }
 finally {

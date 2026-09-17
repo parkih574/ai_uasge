@@ -15,6 +15,6 @@ try {
     if ([string]::IsNullOrWhiteSpace($rawInput)) { return }
     $usageSnapshot = Convert-AntigravityPayload ($rawInput | ConvertFrom-Json)
     # 전체 입력 대신 계정·요금제·한도만 저장한다.
-    Set-JsonAtomic $usageSnapshot $ANTIGRAVITY_CACHE
+    Save-UsageCache $usageSnapshot $ANTIGRAVITY_CACHE
 }
 catch { exit 1 }

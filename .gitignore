@@ -1,6 +1,7 @@
 # Local development output and internal progress notes
 /work/
 /docs/exec-plans/
+/.impeccable/review/
 
 # Local settings, caches, and credentials
 .env

@@ -38,6 +38,7 @@ $STATE_CACHE       = Join-Path $DATA_DIR 'state-cache.json'   # 마지막 성공
 $ANTIGRAVITY_CACHE = Join-Path $DATA_DIR 'antigravity-cache.json'
 $ANTIGRAVITY_STATE_CACHE = Join-Path $DATA_DIR 'antigravity-state-cache.json'
 $CLAUDE_STATUS_CACHE = Join-Path $DATA_DIR 'claude-statusline-cache.json'
+$CODEX_STATE_CACHE = Join-Path $DATA_DIR 'codex-state-cache.json'
 $DISPLAY_STATE     = Join-Path $DATA_DIR 'display-state.json'
 
 function Initialize-DataDirectory([switch]$Migrate) {
@@ -75,11 +76,13 @@ function Get-ClaudeCredPath {
     )
 }
 
+function Get-CodexProfile {
+    if ($env:CODEX_HOME) { return [System.IO.Path]::GetFullPath($env:CODEX_HOME) }
+    return Join-Path $HOME '.codex'
+}
+
 function Get-CodexSessionsPath {
-    if ($env:CODEX_HOME) { return Get-FirstExisting @((Join-Path $env:CODEX_HOME 'sessions')) }
-    return Get-FirstExisting @(
-        (Join-Path $HOME '.codex\sessions')
-    )
+    return Get-FirstExisting @((Join-Path (Get-CodexProfile) 'sessions'))
 }
 
 $state = @{
@@ -237,6 +240,7 @@ function Convert-StoredUsageRow($row) {
     }
     elseif (Get-Field $row @('note')) { $restored.note = [string](Get-Field $row @('note')) }
     if ((Get-Field $row @('isCodexSpark')) -eq $true) { $restored.isCodexSpark = $true }
+    if ((Get-Field $row @('cached')) -eq $true) { $restored.cached = $true }
     if (Test-Field $row 'modelKey') { $restored.modelKey = [string](Get-Field $row @('modelKey')) }
     return $restored
 }
@@ -805,9 +809,13 @@ function Get-CodexAppServerSnapshot {
         if (-not $account -or $kind -ne 'chatgpt') {
             return [pscustomobject]@{ account = $account; result = $null; asOf = Get-Date; unavailable = $true }
         }
-        $process.StandardInput.WriteLine((@{ method = 'account/rateLimits/read'; id = 3 } | ConvertTo-Json -Compress))
-        $process.StandardInput.Flush()
-        $result = Read-CodexResponse $process.StandardOutput 3 5000
+        # 계정 확인 뒤 한도 조회만 실패해도 확인된 계정의 마지막 기록을 복원할 수 있다.
+        try {
+            $process.StandardInput.WriteLine((@{ method = 'account/rateLimits/read'; id = 3 } | ConvertTo-Json -Compress))
+            $process.StandardInput.Flush()
+            $result = Read-CodexResponse $process.StandardOutput 3 5000
+        }
+        catch { $result = $null }
         return [pscustomobject]@{ result = $result; account = $account; asOf = Get-Date; unavailable = $false }
     }
     finally {
@@ -860,7 +868,7 @@ function Get-CodexUsageFromLogs([string]$sessions) {
 $script:claudeSamples = @()
 
 function Update-ClaudeForecast($rows) {
-    $found = @($rows | Where-Object { $_.name -eq '5h' -and -not $_.stale })
+    $found = @($rows | Where-Object { $_.name -eq '5h' -and -not $_.stale -and -not $_.cached })
     if ($found.Count -eq 0) { $script:claudeSamples = @(); return }
     $row = $found[0]
     $resetKey = if ($row.reset) { ([datetime]$row.reset).ToString('s') } else { '' }
@@ -932,6 +940,8 @@ function Get-ClaudeUsage([switch]$Force) {
     }
     if ($cached) {
         $state.claude.rows = $cached.rows
+        foreach ($row in $state.claude.rows) { $row.cached = $true }
+        if (-not $state.claude.plan) { $state.claude.plan = $cached.plan }
         $state.claude.updated = $cached.updated
         $state.claude.source = $cached.source
         $state.claude.success = $true
@@ -966,7 +976,7 @@ function Get-ClaudeUsage([switch]$Force) {
         $script:claudeBackoffUntil = $null
         $script:claude429Count = 0
         try {
-            Set-JsonAtomic @{ plan = $state.claude.plan; account = $state.claude.account; profile = $profile; source = $state.claude.source; rows = $rows; updated = $state.claude.updated } $STATE_CACHE 5
+            Save-UsageCache @{ plan = $state.claude.plan; account = $state.claude.account; profile = $profile; source = $state.claude.source; rows = $rows; updated = $state.claude.updated } $STATE_CACHE
         }
         catch { }
     }
@@ -996,8 +1006,8 @@ function Get-ClaudeUsage([switch]$Force) {
 function Get-CodexUsage {
     try {
         $fallback = $false
-        try {
-            $snapshot = Get-CodexAppServerSnapshot
+        try { $snapshot = Get-CodexAppServerSnapshot } catch { $snapshot = $null }
+        if ($snapshot) {
             $state.gpt.account = [string](Get-Field $snapshot.account @('email'))
             $state.gpt.plan = Format-Plan (Get-Field $snapshot.account @('planType'))
             $state.gpt.source = 'Codex CLI/데스크톱 앱 서버'
@@ -1006,11 +1016,29 @@ function Get-CodexUsage {
                 $state.gpt.err = 'ChatGPT 계정 로그인이 필요합니다. API 키 계정의 구독 한도는 제공되지 않습니다'
                 return
             }
-            $converted = Convert-CodexSnapshot $snapshot.result $snapshot.account
+            $profile = Get-CodexProfile
+            try { $converted = Convert-CodexSnapshot $snapshot.result $snapshot.account }
+            catch {
+                $cached = Read-UsageCache $CODEX_STATE_CACHE $state.gpt.account $profile
+                if (-not $cached -or -not $cached.rows.Count) { throw }
+                $state.gpt.rows = $cached.rows
+                foreach ($row in $state.gpt.rows) { $row.cached = $true }
+                if (-not $state.gpt.plan) { $state.gpt.plan = $cached.plan }
+                $state.gpt.asOf = $cached.updated; $state.gpt.source = $cached.source
+                $state.gpt.err = $null # 마지막 조회 시각으로 기록 시점을 표시한다.
+                $state.gpt.success = $true
+                return
+            }
+            try {
+                Save-UsageCache @{
+                    account=$state.gpt.account; profile=$profile; plan=$converted.plan
+                    source=$state.gpt.source; rows=$converted.rows; updated=$snapshot.asOf
+                } $CODEX_STATE_CACHE
+            } catch { } # 저장 실패가 현재 조회한 수치를 숨기지 않는다.
         }
-        catch {
+        else {
             $sessions = Get-CodexSessionsPath
-            if (-not $sessions) { throw }
+            if (-not $sessions) { throw 'Codex 기록 경로가 없습니다' }
             $snapshot = Get-CodexUsageFromLogs $sessions
             $converted = Convert-CodexSnapshot $snapshot.result $null
             $state.gpt.source = 'Codex 세션 로그'
@@ -1040,6 +1068,7 @@ function Get-AntigravityUsage {
         $saved = Get-Content -LiteralPath $ANTIGRAVITY_STATE_CACHE -Encoding UTF8 -Raw | ConvertFrom-Json
         foreach ($entry in @($saved.groups)) {
             if (-not $entry.updated -or -not (Test-Field $entry 'rows')) { continue }
+            try { Save-AccountUsage $entry $ANTIGRAVITY_STATE_CACHE } catch { }
             # 앱이 꺼졌으면 마지막 계정별 상태를 복원한다. 실행 중이면 확인된 같은 계정만 보완한다.
             $matching = @($liveSnapshots | Where-Object { $_.account -and $_.account -eq $entry.account })
             if ($liveSnapshots.Count -and (-not $matching.Count -or @($matching | Where-Object { $_.rows.Count }).Count)) { continue }
@@ -1050,6 +1079,17 @@ function Get-AntigravityUsage {
             }
         }
     } catch { } # 캐시 손상·부재는 실시간 조회를 막지 않는다.
+    # 다시 로그인한 계정에 한도가 아직 없으면 그 계정의 보존된 마지막 기록을 보완한다.
+    foreach ($live in $liveSnapshots) {
+        if (-not $live.account -or $live.rows.Count) { continue }
+        foreach ($path in @($ANTIGRAVITY_STATE_CACHE, $ANTIGRAVITY_CACHE)) {
+            $cached = Read-UsageCache $path $live.account ''
+            if ($cached -and $cached.rows.Count) {
+                $cached | Add-Member -NotePropertyName live -NotePropertyValue $false
+                $snapshots += $cached
+            }
+        }
+    }
     try {
         if (Test-Path -LiteralPath $ANTIGRAVITY_CACHE) {
             $cached = Get-Content -LiteralPath $ANTIGRAVITY_CACHE -Encoding UTF8 -Raw | ConvertFrom-Json
@@ -1069,6 +1109,7 @@ function Get-AntigravityUsage {
         # 조회 성공 시에만 저장한다. 실패한 폴링으로 값이나 마지막 조회 시각을 덮어쓰지 않는다.
         try {
             $savedGroups = @($groups | ForEach-Object {
+                Save-AccountUsage $_ $ANTIGRAVITY_STATE_CACHE
                 @{ plan=$_.plan; account=$_.account; source=$_.source; scope=$_.scope
                    updated=$(if ($_.updated) { $_.updated.ToString('o') } else { $null })
                    rows=@($_.rows | ForEach-Object { Convert-StoredUsageRow $_ }) }
@@ -1112,15 +1153,65 @@ function Get-ClaudeProfile {
 }
 
 function Read-UsageCache([string]$path, [string]$account, [string]$profile) {
+    if ([string]::IsNullOrWhiteSpace($account)) { return $null }
+    $best = $null
+    foreach ($candidatePath in @($path, (Get-AccountCachePath $path $account $profile))) {
+        try {
+            $cached = Get-Content -LiteralPath $candidatePath -Encoding UTF8 -Raw | ConvertFrom-Json
+            if (([string]$cached.account).Trim() -ne $account.Trim() -or [string]$cached.profile -ne $profile) { continue }
+            if (-not (Test-Field $cached 'rows') -or -not $cached.updated) { continue }
+            $candidate = [pscustomobject]@{
+                account=[string]$cached.account; profile=[string]$cached.profile; plan=[string]$cached.plan
+                rows=@($cached.rows | ForEach-Object { Convert-StoredUsageRow $_ })
+                updated=ConvertTo-LocalTime $cached.updated; source=[string]$cached.source; scope=[string]$cached.scope
+            }
+            if (-not $best -or ($candidate.rows.Count -and -not $best.rows.Count) -or
+                ([bool]$candidate.rows.Count -eq [bool]$best.rows.Count -and $candidate.updated -gt $best.updated)) { $best = $candidate }
+        } catch { } # 한 파일이 손상되어도 같은 계정의 다른 정상 기록은 사용할 수 있다.
+    }
+    return $best
+}
+
+function Get-AccountCachePath([string]$path, [string]$account, [string]$profile) {
+    $identity = $account.Trim().ToLowerInvariant() + "`n" + $profile.ToLowerInvariant()
+    $hash = [System.Security.Cryptography.SHA256]::Create()
+    try { $key = ([BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity)))).Replace('-', '').ToLowerInvariant() }
+    finally { $hash.Dispose() }
+    return Join-Path ($path + '.accounts') ($key + '.json')
+}
+
+function Save-AccountUsage($snapshot, [string]$path) {
+    $account = ([string](Get-Field $snapshot @('account'))).Trim()
+    $rows = @((Get-Field $snapshot @('rows')) | Where-Object { $null -ne $_ })
+    if (-not $account -or -not $snapshot.updated -or -not $rows.Count) { return }
+    $profile = [string](Get-Field $snapshot @('profile'))
+    $accountPath = Get-AccountCachePath $path $account $profile
+    # 여러 CLI 창이 같은 계정 기록을 동시에 쓰더라도 이전 값으로 되돌아가지 않게 한다.
+    $cacheLock = [System.Threading.Mutex]::new($false, 'Local\AiUsageTrayCache-' + [IO.Path]::GetFileNameWithoutExtension($accountPath))
+    $locked = $false
     try {
-        $cached = Get-Content -LiteralPath $path -Encoding UTF8 -Raw | ConvertFrom-Json
-        if (-not $account -or $cached.account -ne $account -or $cached.profile -ne $profile) { return $null }
-        if (-not (Test-Field $cached 'rows') -or -not $cached.updated) { return $null }
-        return [pscustomobject]@{
-            rows = @($cached.rows | ForEach-Object { Convert-StoredUsageRow $_ })
-            updated = ConvertTo-LocalTime $cached.updated; source = [string]$cached.source
-        }
-    } catch { return $null }
+        try { $locked = $cacheLock.WaitOne(5000) } catch [System.Threading.AbandonedMutexException] { $locked = $true }
+        if (-not $locked) { throw '계정 기록 저장 대기 시간 초과' }
+        $updated = ConvertTo-LocalTime $snapshot.updated
+        try {
+            $previous = Get-Content -LiteralPath $accountPath -Encoding UTF8 -Raw | ConvertFrom-Json
+            if ($previous.account -eq $account -and [string]$previous.profile -eq $profile -and (ConvertTo-LocalTime $previous.updated) -ge $updated) { return }
+        } catch { }
+        Set-JsonAtomic @{
+            account=$account; profile=$profile; plan=[string]$snapshot.plan; source=[string]$snapshot.source
+            scope=[string]$snapshot.scope; updated=$updated.ToString('o')
+            rows=@($rows | ForEach-Object { Convert-StoredUsageRow $_ })
+        } $accountPath
+    } finally { if ($locked) { $cacheLock.ReleaseMutex() }; $cacheLock.Dispose() }
+}
+
+function Save-UsageCache($snapshot, [string]$path) {
+    # 기존 단일 계정 파일을 덮어쓰기 전에 계정별 기록으로 보존한다.
+    try { $previous = Get-Content -LiteralPath $path -Encoding UTF8 -Raw | ConvertFrom-Json }
+    catch { $previous = $null }
+    if ($previous) { try { Save-AccountUsage $previous $path } catch { } }
+    Save-AccountUsage $snapshot $path
+    Set-JsonAtomic $snapshot $path
 }
 
 function Get-StatusLineCommand([string]$scriptPath) {
@@ -1128,6 +1219,38 @@ function Get-StatusLineCommand([string]$scriptPath) {
     $command = "[Console]::In.ReadToEnd() | & '$escaped'"
     $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
     return "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
+}
+
+function Test-UsageStatusLineCommand([string]$command, [string]$scriptName) {
+    if ($command -match '(?i)-EncodedCommand\s+([A-Za-z0-9+/=]+)') {
+        try { $command = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1])) }
+        catch { return $false }
+    }
+    return $command -match ('(?i)(?:^|[\\/])' + [regex]::Escape($scriptName) + '(?=["''\s]|$)')
+}
+
+function Write-UsageStatusLineSettings([string]$settings, [string]$callback, [bool]$isClaude, [switch]$Remove) {
+    $exists = Test-Path -LiteralPath $settings -PathType Leaf
+    if ($Remove -and -not $exists) { return $false }
+    if (-not $Remove -and -not (Test-Path -LiteralPath $callback -PathType Leaf)) { throw '사용량 연동 스크립트가 없습니다. 앱 설치 폴더를 확인하세요.' }
+    if (-not (Test-Path -LiteralPath (Split-Path -Parent $settings) -PathType Container)) { throw 'CLI 설정 폴더가 없습니다. CLI를 설치하고 로그인한 뒤 다시 시도하세요.' }
+    $json = if ($exists) { Get-Content -LiteralPath $settings -Encoding UTF8 -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
+    if ($null -eq $json -or $json -isnot [pscustomobject]) { throw 'CLI 설정 파일이 올바른 JSON 객체가 아닙니다.' }
+    if ($Remove) {
+        if (-not (Test-UsageStatusLineCommand ([string]$json.statusLine.command) ([IO.Path]::GetFileName($callback)))) { return $false }
+        $json.PSObject.Properties.Remove('statusLine')
+    } else {
+        # 예전 설치 경로와 상태줄 옵션을 함께 교체해 현재 앱의 콜백만 실행한다.
+        $statusLine = [ordered]@{type='command';command=(Get-StatusLineCommand $callback)}
+        if (-not $isClaude) { $statusLine.enabled=$true; $statusLine.stack_with_default=$true }
+        $json | Add-Member -NotePropertyName statusLine -NotePropertyValue $statusLine -Force
+    }
+    if ($exists) {
+        $backup = $settings + '.ai-usage-tray.' + (Get-Date).ToString('yyyyMMddHHmmssfff') + '.' + [guid]::NewGuid().ToString('N') + '.bak'
+        Copy-Item -LiteralPath $settings -Destination $backup -ErrorAction Stop
+    }
+    Set-JsonAtomic $json $settings 50
+    return $true
 }
 
 # ---------- 테스트·백그라운드 훅 (UI 없음) ----------
@@ -1256,6 +1379,7 @@ Add-Type -MemberDefinition @'
 [DllImport("gdi32.dll", CharSet = CharSet.Unicode)] public static extern int AddFontResourceEx(string lpFileName, uint fl, IntPtr pdv);
 [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
 [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
+[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
 '@ -Name Native -Namespace Win32
 
 # 설정 텍스트는 GDI+ 회색조 안티앨리어싱으로 그린다. 번들 Pretendard는 힌팅이 없어
@@ -1265,9 +1389,20 @@ if ($PSVersionTable.PSEdition -eq 'Core') {
     $settingsReferences += @('System.Drawing.Common', 'System.Drawing.Primitives', 'System.ComponentModel.Primitives', 'System.Windows.Forms.Primitives')
 }
 Add-Type -ReferencedAssemblies $settingsReferences -WarningAction SilentlyContinue -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Windows.Forms;
 namespace TraySettings {
+    internal static class Shape {
+        internal static GraphicsPath Round(RectangleF r, float radius) {
+            GraphicsPath p = new GraphicsPath(); float d = radius * 2;
+            p.AddArc(r.Left, r.Top, d, d, 180, 90); p.AddArc(r.Right-d, r.Top, d, d, 270, 90);
+            p.AddArc(r.Right-d, r.Bottom-d, d, d, 0, 90); p.AddArc(r.Left, r.Bottom-d, d, d, 90, 90);
+            p.CloseFigure(); return p;
+        }
+    }
     public class Label : System.Windows.Forms.Label {
         public Label() { UseCompatibleTextRendering = true; }
         protected override void OnPaint(PaintEventArgs e) {
@@ -1276,17 +1411,58 @@ namespace TraySettings {
         }
     }
     public class CheckBox : System.Windows.Forms.CheckBox {
-        public CheckBox() { UseCompatibleTextRendering = true; }
+        private bool hover;
+        public CheckBox() { UseCompatibleTextRendering = true; AutoSize = false; DoubleBuffered = true; Cursor = Cursors.Hand; }
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
         protected override void OnPaint(PaintEventArgs e) {
+            e.Graphics.Clear(BackColor);
+            float s = e.Graphics.DpiX / 96f;
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.TextRenderingHint = TextRenderingHint.AntiAlias;
-            base.OnPaint(e);
+            RectangleF track = new RectangleF(Width - 41*s, (Height - 23*s)/2, 40*s, 23*s);
+            bool on = Enabled && Checked;
+            Color fill = !Enabled ? Color.FromArgb(237,240,244) : on ? Color.FromArgb(37,99,235) : Color.FromArgb(183,194,208);
+            if (hover && Enabled) fill = ControlPaint.Dark(fill, .06f);
+            using (GraphicsPath p = Shape.Round(track, track.Height/2))
+            using (Brush b = new SolidBrush(fill)) e.Graphics.FillPath(b, p);
+            using (Brush b = new SolidBrush(Enabled ? Color.White : Color.FromArgb(250,251,252)))
+                e.Graphics.FillEllipse(b, track.Left + (on ? 21 : 4)*s, track.Top+4*s, 15*s, 15*s);
+            using (StringFormat f = new StringFormat())
+            using (Brush b = new SolidBrush(ForeColor)) {
+                f.LineAlignment = StringAlignment.Center; f.FormatFlags = StringFormatFlags.NoWrap; f.Trimming = StringTrimming.EllipsisCharacter;
+                e.Graphics.DrawString(Text, Font, b, new RectangleF(0,0,Math.Max(0,track.Left-9*s),Height), f);
+            }
+            if (Focused && ShowFocusCues) ControlPaint.DrawFocusRectangle(e.Graphics, Rectangle.Inflate(Rectangle.Round(track),2,2), Color.FromArgb(37,99,235), BackColor);
         }
     }
     public class Button : System.Windows.Forms.Button {
-        public Button() { UseCompatibleTextRendering = true; }
+        private bool hover;
+        public bool Primary { get; set; }
+        public bool LinkStyle { get; set; }
+        public Button() { UseCompatibleTextRendering = true; DoubleBuffered = true; FlatStyle = FlatStyle.Flat; Cursor = Cursors.Hand; }
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
         protected override void OnPaint(PaintEventArgs e) {
+            e.Graphics.Clear(BackColor);
+            float s = e.Graphics.DpiX / 96f;
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.TextRenderingHint = TextRenderingHint.AntiAlias;
-            base.OnPaint(e);
+            Color fill = Primary ? Color.FromArgb(37,99,235) : Color.White;
+            if (hover && Enabled) fill = Primary ? Color.FromArgb(30,86,210) : Color.FromArgb(246,248,251);
+            using (GraphicsPath p = Shape.Round(new RectangleF(.5f,.5f,Width-1,Height-1),7*s)) {
+                using (Brush b = new SolidBrush(fill)) e.Graphics.FillPath(b,p);
+                if (!Primary && !LinkStyle) using (Pen pen = new Pen(Color.FromArgb(220,225,233))) e.Graphics.DrawPath(pen,p);
+            }
+            using (StringFormat f = new StringFormat())
+            using (Brush b = new SolidBrush(!Enabled ? SystemColors.GrayText : Primary ? Color.White : ForeColor)) {
+                f.Alignment = LinkStyle ? StringAlignment.Near : StringAlignment.Center; f.LineAlignment = StringAlignment.Center;
+                f.FormatFlags = StringFormatFlags.NoWrap;
+                e.Graphics.DrawString(Text, Font, b, new RectangleF(LinkStyle ? 0 : 4*s,0,Width-(LinkStyle ? 24 : 8)*s,Height),f);
+            }
+            if (LinkStyle) using (Pen pen = new Pen(Color.FromArgb(131,144,162),1.5f*s))
+                e.Graphics.DrawLines(pen,new PointF[] {new PointF(Width-12*s,Height/2-4*s),new PointF(Width-8*s,Height/2),new PointF(Width-12*s,Height/2+4*s)});
+            if (Focused && ShowFocusCues) ControlPaint.DrawFocusRectangle(e.Graphics,new Rectangle(3,3,Width-6,Height-6));
         }
     }
 }
@@ -1328,6 +1504,7 @@ $settingsFamily = $script:pfc.Families | Where-Object { $_.Name -eq 'Pretendard 
 $fontSettings = if ($settingsFamily) { [System.Drawing.Font]::new($settingsFamily, 12, [System.Drawing.FontStyle]::Regular) }
     else { [System.Drawing.Font]::new('Malgun Gothic', 12, [System.Drawing.FontStyle]::Regular) }
 $fontSettingsHeading = [System.Drawing.Font]::new($fontBase.FontFamily, 13, [System.Drawing.FontStyle]::Bold)
+$fontSettingsSmall = [System.Drawing.Font]::new($fontSettings.FontFamily, 9.5, [System.Drawing.FontStyle]::Regular)
 
 function Get-PctColor([int]$pct) {
     if ($pct -ge 90) { return [System.Drawing.Color]::FromArgb(255, 82, 82) }
@@ -1339,16 +1516,6 @@ function Format-Reset($dt) {
     if (-not $dt) { return '' }
     if ($dt.Date -eq (Get-Date).Date) { return $dt.ToString('HH:mm') }
     return $dt.ToString('M/d HH:mm')
-}
-
-# 스냅샷이 얼마나 낡았는지 — 1시간 미만이면 굳이 알릴 것 없으니 빈 문자열.
-# 시각만 보면 "오늘 13:54" 인지 "어제 13:54" 인지 헷갈린다는 게 이 표시의 이유다.
-function Format-Age($dt) {
-    if (-not $dt) { return '' }
-    $mins = ((Get-Date) - $dt).TotalMinutes
-    if ($mins -lt 60) { return '' }
-    if ($mins -ge 1440) { return " · $([int][Math]::Floor($mins / 1440))일 전" }
-    return " · $([int][Math]::Floor($mins / 60))시간 전"
 }
 
 # ---------- 트레이 아이콘 ----------
@@ -1489,6 +1656,9 @@ $popupSettings.add_Click({ Show-SettingsDialog })
 $popupTip = [System.Windows.Forms.ToolTip]::new()
 $popupTip.SetToolTip($popupSettings, '설정')
 $popupBody.Controls.Add($popupSettings)
+$popupBody.add_ClientSizeChanged({ param($sender, $eventArgs)
+    $popupSettings.Location = [System.Drawing.Point]::new($sender.ClientSize.Width - $popupSettings.Width - 8 + $sender.AutoScrollPosition.X, 8 + $sender.AutoScrollPosition.Y)
+})
 $form.Controls.Add($popupBody)
 $form.add_Disposed({ $popupSettings.Image.Dispose(); $popupTip.Dispose() })
 $form.KeyPreview = $true
@@ -1536,7 +1706,7 @@ function Draw-Section($g, [string]$title, [string]$plan, $rows, [string]$err, $a
     $rows = @(Sort-UsageRows $rows)
     $t = $title
     $t += if ($plan) { " — $plan" } else { ' — 요금제 확인 불가' }
-    if ($asOf) { $t += "   ($(Format-Reset $asOf) 기준$(Format-Age $asOf))" }
+    if ($asOf) { $t += "   ($($asOf.ToString('MM.dd  HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)))" }
     if ($y -eq 12) {
         # 첫 제목과 설정 버튼이 같은 줄을 공유한다. 좁은 화면에서도 서로 겹치지 않는다.
         Measure-PopupWidth $g $t $fontBold 54
@@ -1613,6 +1783,7 @@ function Draw-Popup($g) {
         foreach ($section in $sections) {
             if ($drawn -gt 0) { $y += 10 }
             $sectionError = if ($state.antigravity.err) { $state.antigravity.err } else { $section.err }
+            if ($section.updated -and $section.rows.Count -and $sectionError -like '실시간 조회 서버를 찾지 못했습니다.*') { $sectionError = $null }
             $y = Draw-Section $g 'Antigravity' $section.plan @(Get-VisibleAntigravityRows $section.rows) $sectionError $section.updated $y $section.source $section.account
             $drawn++
         }
@@ -1621,29 +1792,27 @@ function Draw-Popup($g) {
         $g.DrawString('표시할 항목을 선택하세요', $fontBase, (Get-Brush $COL_GRAY), 14, $y)
         $y += 28
     }
-    $y += 6
-    $updated = @(@($state.claude.updated, $state.gpt.asOf, $state.antigravity.asOf) |
-        Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1)
-    $upd = if ($updated.Count -gt 0) { $updated[0].ToString('HH:mm:ss') } else { '-' }
-    $footer = "갱신 $upd"
-    $footer += ' · 로그·상태줄은 마지막 활동 기준'
-    $g.DrawString($footer, $fontSmall, (Get-Brush $COL_GRAY), 14, $y)
-    $y += 22
-    return $y + 10
+    return $y + 4
 }
 
-function Build-Popup {
+function Build-Popup([System.Drawing.Rectangle]$workArea = [System.Drawing.Rectangle]::Empty) {
     # 그리기 없이 크기만 계산(1px 캔버스) 후 다시 그리게 무효화
     $mb = [System.Drawing.Bitmap]::new(1, 1)
     $mg = [System.Drawing.Graphics]::FromImage($mb)
     $contentHeight = Draw-Popup $mg
     # 소진 예측이 붙은 줄은 기본 폭을 넘는다. MeasureString 이 글자 앞뒤 여백을 포함하므로 그게 오른쪽 여백이 된다.
     $contentWidth = [Math]::Max($POPUP_WIDTH, $script:popupNeedWidth + 8)
-    $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $area = if (-not $workArea.IsEmpty) { $workArea }
+        elseif ($form.Visible) { [System.Windows.Forms.Screen]::FromControl($form).WorkingArea }
+        else { [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea }
     $form.Width = [Math]::Min($contentWidth + 20, $area.Width - 16)
-    $form.Height = [Math]::Min($contentHeight + 20, $area.Height - 16)
+    $availableWidth = $form.ClientSize.Width - $form.Padding.Horizontal
+    if ($contentHeight + $form.Padding.Vertical -gt $area.Height - 16) { $availableWidth -= [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth }
+    $scrollHeight = if ($contentWidth -gt $availableWidth) { [System.Windows.Forms.SystemInformation]::HorizontalScrollBarHeight } else { 0 }
+    $form.Height = [Math]::Min($contentHeight + $form.Padding.Vertical + $scrollHeight, $area.Height - 16)
     $popupBody.AutoScrollMinSize = [System.Drawing.Size]::new($contentWidth, $contentHeight)
-    $popupSettings.Location = [System.Drawing.Point]::new($popupBody.ClientSize.Width - $popupSettings.Width - 8 + $popupBody.AutoScrollPosition.X, 8 + $popupBody.AutoScrollPosition.Y)
+    # 로딩 결과로 크기가 바뀔 때도 같은 화면의 오른쪽 아래에 다시 맞춘다.
+    $form.Location = [System.Drawing.Point]::new($area.Right - $form.Width - 8, $area.Bottom - $form.Height - 8)
     $mg.Dispose(); $mb.Dispose()
     $form.Invalidate($true)
 }
@@ -1655,8 +1824,6 @@ function Show-Popup {
     }
     # 로컬 앱 서버도 서버 쪽 한도를 갱신하므로 60초 안에는 이전 수집 결과를 쓴다.
     Build-Popup
-    $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    $form.Location = [System.Drawing.Point]::new($wa.Right - $form.Width - 8, $wa.Bottom - $form.Height - 8)
     $form.Show()
     $form.Activate()
 }
@@ -1687,7 +1854,7 @@ function Test-UsageAlert {
             if ($null -eq $r) { continue }
             $slot = "$($src.label)|$($r.name)"
             $activeSlots[$slot] = $true
-            if (-not $src.on -or [int]$r.pct -lt 90 -or [bool]$r.stale) { continue }
+            if (-not $src.on -or [int]$r.pct -lt 90 -or [bool]$r.stale -or [bool]$r.cached) { continue }
             if ($r.reset -and [datetime]$r.reset -le (Get-Date)) { continue }
             $cycle = if ($r.reset) { ([datetime]$r.reset).ToString('s') } else { 'no-reset' }
             if ($script:notified[$slot] -eq $cycle) { continue }
@@ -1711,6 +1878,7 @@ function Merge-CollectionResult($result) {
     foreach ($name in 'claude', 'gpt', 'antigravity') {
         $incoming = $result.state.$name
         if ($incoming.success -or $incoming.err) {
+            if ($name -eq 'claude' -and $incoming.account -ne $state.claude.account) { $script:claudeSamples = @() }
             foreach ($field in 'plan', 'account', 'source') { $state[$name][$field] = [string]$incoming.$field }
         }
         if ($incoming.clear) {
@@ -1929,25 +2097,46 @@ function Start-TrayRestart {
 
 function New-SettingsCheck($parent, [string]$label, [bool]$checked) {
     $check = [TraySettings.CheckBox]::new()
-    $check.Text = $label; $check.AutoSize = $true; $check.Checked = $checked
-    $check.Margin = [System.Windows.Forms.Padding]::new(0, 3, 0, 5)
+    $check.Text = $label; $check.Checked = $checked
+    $check.Size = [System.Drawing.Size]::new(220, 36)
+    $check.Margin = [System.Windows.Forms.Padding]::Empty
     $parent.Controls.Add($check)
     return $check
 }
 
 function New-SettingsUsageRow($parent, $draft, [string]$label, [string]$key, [string[]]$periods) {
-    $row = [System.Windows.Forms.FlowLayoutPanel]::new()
-    $row.AutoSize = $true; $row.AutoSizeMode = 'GrowAndShrink'; $row.WrapContents = $false
-    $row.Margin = [System.Windows.Forms.Padding]::new(24, 0, 0, 0)
+    $row = [System.Windows.Forms.TableLayoutPanel]::new()
+    $row.Height = 36; $row.ColumnCount = 3; $row.RowCount = 1
+    [void]$row.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+    $row.Margin = [System.Windows.Forms.Padding]::new(12, 0, 0, 0)
+    [void]$row.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+    [void]$row.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Absolute, 104))
+    [void]$row.ColumnStyles.Add([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Absolute, 124))
+    $nameCell = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $nameCell.Dock = 'Fill'; $nameCell.WrapContents = $false; $nameCell.Margin = [System.Windows.Forms.Padding]::Empty
     $name = [TraySettings.Label]::new()
     $name.Text = $label; $name.AutoSize = $true
-    $name.Margin = [System.Windows.Forms.Padding]::new(0, 3, 8, 0)
-    $row.Controls.Add($name)
+    $name.Margin = [System.Windows.Forms.Padding]::new(0, 8, 8, 0)
+    $nameCell.Controls.Add($name)
+    if ($key -eq 'codex' -and (Test-CodexProPlan $state.gpt.plan)) {
+        $badge = [TraySettings.Label]::new()
+        $badge.Text = 'Pro · 5h 숨김'; $badge.Font = $fontSettingsSmall; $badge.AutoSize = $true
+        $badge.ForeColor = [System.Drawing.Color]::Black
+        $badge.BackColor = [System.Drawing.Color]::White
+        $badge.Padding = [System.Windows.Forms.Padding]::new(4, 1, 4, 1)
+        $badge.Margin = [System.Windows.Forms.Padding]::new(0, 8, 0, 0)
+        $nameCell.Controls.Add($badge)
+    }
+    $row.Controls.Add($nameCell, 0, 0)
+    $row.Tag = @{NameLabel=$name;NameCell=$nameCell}
     foreach ($period in $periods) {
         $itemKey = "$key.$period"
-        $check = New-SettingsCheck $row $period (Test-UsageItemVisible $itemKey)
+        $check = [TraySettings.CheckBox]::new()
+        $check.Text = $period; $check.Checked = Test-UsageItemVisible $itemKey; $check.Dock = 'Fill'
         $check.AccessibleName = "$label $period"
-        $check.Margin = [System.Windows.Forms.Padding]::new(0, 3, 24, 5)
+        $check.Margin = [System.Windows.Forms.Padding]::new(12, 0, 0, 0)
+        $column = if ($period -eq '5h') { 1 } else { 2 }
+        $row.Controls.Add($check, $column, 0)
         $draft.UsageItems[$itemKey] = $check
     }
     $parent.Controls.Add($row)
@@ -1960,17 +2149,19 @@ function Update-SettingsLayout($dialog) {
     $content.SuspendLayout()
     try {
         $scale = [Math]::Max(96, [Win32.Native]::GetDpiForWindow($dialog.Handle)) / 96.0
-        # 화면 폭과 관계없이 한 열을 유지하고 세로 스크롤 공간을 확보한다.
-        $width = [Math]::Max(1, $content.ClientSize.Width - $content.Padding.Horizontal - [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth)
+        $width = [Math]::Max(1, $content.ClientSize.Width - $content.Padding.Horizontal)
         foreach ($control in $content.Controls) {
-            $control.MaximumSize = [System.Drawing.Size]::new([Math]::Max(1, $width - $control.Margin.Horizontal), 0)
-            if ($control -is [System.Windows.Forms.FlowLayoutPanel]) {
-                $control.WrapContents = $true
-                $name = $control.Controls[0]
-                $name.MinimumSize = [System.Drawing.Size]::new([int](100 * $scale), 0)
-                $name.MaximumSize = $name.MinimumSize
+            $control.MaximumSize = [System.Drawing.Size]::new([Math]::Max(1, $width - $control.Margin.Horizontal), [int]::MaxValue)
+            $control.Width = $control.MaximumSize.Width
+            if ($control -is [System.Windows.Forms.TableLayoutPanel]) {
+                $control.ColumnStyles[1].Width = 104 * $scale
+                $control.ColumnStyles[2].Width = 124 * $scale
             }
         }
+        # FlowLayoutPanel의 자동 범위는 끝 여백을 생략하므로 마지막 버튼까지 스크롤되게 지정한다.
+        $height = $content.Padding.Vertical
+        foreach ($control in $content.Controls) { $height += $control.Height + $control.Margin.Vertical }
+        $content.AutoScrollMinSize = [System.Drawing.Size]::new(0, $height)
     }
     finally { $content.ResumeLayout($true); $dialog.Tag.LayingOut = $false }
 }
@@ -1983,9 +2174,12 @@ function Set-SettingsWindowBounds($dialog, [System.Drawing.Rectangle]$workArea) 
     $frameWidth = $dialog.Width - $dialog.ClientSize.Width
     $frameHeight = $dialog.Height - $dialog.ClientSize.Height
     $dialog.MinimumSize = [System.Drawing.Size]::new([Math]::Min([int](460 * $scale), $width), [Math]::Min([int](400 * $scale), $height))
-    $dialog.Size = [System.Drawing.Size]::new([Math]::Min([int](560 * $scale) + $frameWidth, $width), [Math]::Min([int](620 * $scale) + $frameHeight, $height))
-    $dialog.Location = [System.Drawing.Point]::new($workArea.Left + [int](($workArea.Width - $dialog.Width) / 2), $workArea.Top + [int](($workArea.Height - $dialog.Height) / 2))
+    $dialog.Width = [Math]::Min([int](560 * $scale) + $frameWidth, $width)
     Update-SettingsLayout $dialog
+    $contentHeight = $dialog.Tag.Content.Padding.Vertical
+    foreach ($control in $dialog.Tag.Content.Controls) { $contentHeight += $control.Height + $control.Margin.Vertical }
+    $dialog.Height = [Math]::Min($contentHeight + $dialog.Tag.Footer.Height + $frameHeight, $height)
+    $dialog.Location = [System.Drawing.Point]::new($workArea.Left + [int](($workArea.Width - $dialog.Width) / 2), $workArea.Top + [int](($workArea.Height - $dialog.Height) / 2))
 }
 
 function New-SettingsDialog {
@@ -1997,52 +2191,94 @@ function New-SettingsDialog {
     $dialog.SuspendLayout()
     $dialog.Text = 'AI 사용량 설정'
     $dialog.Font = $fontSettings
+    $dialog.BackColor = [System.Drawing.Color]::White
+    $dialog.ForeColor = [System.Drawing.Color]::Black
     $dialog.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
     $dialog.ClientSize = [System.Drawing.Size]::new(560, 620)
     $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
     $dialog.MaximizeBox = $true; $dialog.MinimizeBox = $false
     $dialog.Tag = @{Checks=@{};Models=@{};UsageItems=@{};RestartReady=$false}
-    $iconBitmap = Draw-TrayIconBitmap 32 32 ([System.Drawing.SystemColors]::WindowText)
-    $iconHandle = $iconBitmap.GetHicon()
-    $iconView = [System.Drawing.Icon]::FromHandle($iconHandle)
-    try { $dialog.Icon = [System.Drawing.Icon]$iconView.Clone() }
-    finally { $iconView.Dispose(); [void][Win32.Native]::DestroyIcon($iconHandle); $iconBitmap.Dispose() }
-    $dialog.add_Disposed({ param($sender, $eventArgs); $sender.Icon.Dispose() })
+    foreach ($kind in 'Taskbar', 'Caption') {
+        $color = if ($kind -eq 'Taskbar') { [System.Drawing.Color]::White } else { $dialog.ForeColor }
+        $iconBitmap = Draw-TrayIconBitmap 32 32 $color
+        $iconHandle = $iconBitmap.GetHicon()
+        $iconView = [System.Drawing.Icon]::FromHandle($iconHandle)
+        try { $dialog.Tag[$kind + 'Icon'] = [System.Drawing.Icon]$iconView.Clone() }
+        finally { $iconView.Dispose(); [void][Win32.Native]::DestroyIcon($iconHandle); $iconBitmap.Dispose() }
+    }
+    $dialog.Icon = $dialog.Tag.TaskbarIcon
+    $dialog.add_HandleCreated({ param($sender, $eventArgs)
+        [void][Win32.Native]::SendMessage($sender.Handle, 0x80, [IntPtr]::Zero, $sender.Tag.CaptionIcon.Handle)
+    })
+    $dialog.add_Shown({ param($sender, $eventArgs)
+        [void][Win32.Native]::SendMessage($sender.Handle, 0x80, [IntPtr]::Zero, $sender.Tag.CaptionIcon.Handle)
+    })
+    $dialog.add_Disposed({ param($sender, $eventArgs); $sender.Tag.TaskbarIcon.Dispose(); $sender.Tag.CaptionIcon.Dispose() })
 
-    $footer = [System.Windows.Forms.FlowLayoutPanel]::new()
-    $footer.Dock = 'Bottom'; $footer.AutoSize = $true; $footer.FlowDirection = 'RightToLeft'
-    $footer.AutoSizeMode = 'GrowAndShrink'
-    $footer.Padding = [System.Windows.Forms.Padding]::new(12)
+    $footer = [System.Windows.Forms.Panel]::new()
+    $footer.Dock = 'Bottom'; $footer.Height = 56
+    $footer.Padding = [System.Windows.Forms.Padding]::new(24, 8, 24, 8)
+    $footer.add_Paint({ param($sender, $eventArgs); $eventArgs.Graphics.DrawLine([System.Drawing.Pens]::Gainsboro, 0, 0, $sender.Width, 0) })
+    $actions = [System.Windows.Forms.FlowLayoutPanel]::new()
+    $actions.Dock = 'Right'; $actions.AutoSize = $true; $actions.AutoSizeMode = 'GrowAndShrink'
+    $actions.FlowDirection = 'RightToLeft'; $actions.WrapContents = $false
     $done = [TraySettings.Button]::new()
-    $done.Text = '완료 및 재시작'; $done.AutoSize = $true; $done.Padding = [System.Windows.Forms.Padding]::new(8, 4, 8, 4)
+    $done.Text = '완료 및 재시작'; $done.Primary = $true; $done.AutoSize = $true; $done.AutoSizeMode = 'GrowAndShrink'; $done.Padding = [System.Windows.Forms.Padding]::new(10, 4, 10, 4)
+    $done.Margin = [System.Windows.Forms.Padding]::new(8, 0, 0, 0)
     $cancel = [TraySettings.Button]::new()
-    $cancel.Text = '취소'; $cancel.AutoSize = $true; $cancel.Padding = $done.Padding
+    $cancel.Text = '취소'; $cancel.AutoSize = $true; $cancel.AutoSizeMode = 'GrowAndShrink'; $cancel.Padding = $done.Padding
+    $cancel.Margin = [System.Windows.Forms.Padding]::Empty
     $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $footer.Controls.AddRange(@($done, $cancel))
+    $actions.Controls.AddRange(@($done, $cancel))
     $dialog.AcceptButton = $done; $dialog.CancelButton = $cancel
     $status = [TraySettings.Label]::new()
-    $status.Dock = 'Bottom'; $status.Height = 64; $status.Padding = [System.Windows.Forms.Padding]::new(20, 5, 20, 0)
-    $status.Text = '완료하면 설정을 저장하고 자동으로 재시작합니다.'
+    $status.Dock = 'Fill'; $status.Font = $fontSettingsSmall; $status.TextAlign = 'MiddleLeft'
+    $status.ForeColor = [System.Drawing.Color]::Black
+    $status.Text = "완료하면 설정을 저장하고`n자동으로 재시작합니다."
+    $footer.Controls.AddRange(@($status, $actions))
     $dialog.Tag.Status = $status
+    $dialog.Tag.Footer = $footer
     $content = [System.Windows.Forms.FlowLayoutPanel]::new()
     $content.Dock = 'Fill'; $content.FlowDirection = 'TopDown'; $content.WrapContents = $false
-    $content.AutoScroll = $true; $content.Padding = [System.Windows.Forms.Padding]::new(20, 12, 20, 12)
-    $dialog.Controls.AddRange(@($content, $status, $footer))
+    $content.AutoScroll = $true; $content.Padding = [System.Windows.Forms.Padding]::new(24, 6, 24, 6)
+    $dialog.Controls.AddRange(@($content, $footer))
     $dialog.Tag.Content = $content
     foreach ($section in @('Claude', 'Codex', 'Antigravity', '알림 및 시작', 'CLI 연동')) {
         $providerKey = switch ($section) { 'Claude' { 'claude' }; 'Codex' { 'gpt' }; 'Antigravity' { 'antigravity' } }
         $sectionParent = $content
+        if ($content.Controls.Count) {
+            $divider = [System.Windows.Forms.Panel]::new()
+            $divider.Height = 1; $divider.BackColor = [System.Drawing.Color]::FromArgb(233,237,242)
+            $divider.Margin = [System.Windows.Forms.Padding]::new(0, 6, 0, 6)
+            $content.Controls.Add($divider)
+        }
         if ($providerKey) {
             $visible = switch ($providerKey) { 'claude' { $showClaude.Checked }; 'gpt' { $showGpt.Checked }; 'antigravity' { $showAntigravity.Checked } }
             $heading = New-SettingsCheck $sectionParent $section $visible
             $dialog.Tag.Checks[$providerKey] = $heading
+        } elseif ($section -eq 'CLI 연동') {
+            $heading = [System.Windows.Forms.FlowLayoutPanel]::new()
+            $heading.WrapContents = $false
+            $title = [TraySettings.Label]::new()
+            $title.Text = $section; $title.Size = [System.Drawing.Size]::new(112, 36); $title.TextAlign = 'MiddleLeft'
+            $title.Margin = [System.Windows.Forms.Padding]::Empty
+            $help = [TraySettings.Button]::new()
+            $help.Text = '?'; $help.Size = [System.Drawing.Size]::new(32, 32)
+            $help.Margin = [System.Windows.Forms.Padding]::new(0, 2, 0, 2)
+            $help.AccessibleName = 'CLI 연동 도움말'
+            $help.add_Click({ param($sender, $eventArgs); Show-UsageStatusLineHelp $sender.FindForm() })
+            $heading.Controls.AddRange(@($title, $help))
+            $dialog.Tag.CliHelp = $help
+            $sectionParent.Controls.Add($heading)
         } else {
             $heading = [TraySettings.Label]::new()
-            $heading.Text = $section; $heading.AutoSize = $true
+            $heading.Text = $section; $heading.Height = 26; $heading.TextAlign = 'MiddleLeft'
+            $heading.ForeColor = [System.Drawing.Color]::Black
             $sectionParent.Controls.Add($heading)
         }
         $heading.Font = $fontSettingsHeading
-        $heading.Margin = [System.Windows.Forms.Padding]::new(0, 12, 0, 6)
+        $heading.Height = 36
+        $heading.Margin = [System.Windows.Forms.Padding]::new(0, 0, 0, 2)
         switch ($section) {
             'Claude' {
                 New-SettingsUsageRow $sectionParent $dialog.Tag '사용량' 'claude' @('5h', 'weekly')
@@ -2052,14 +2288,14 @@ function New-SettingsDialog {
                 New-SettingsUsageRow $sectionParent $dialog.Tag '5.3spark' 'codex.spark' @('5h', 'weekly')
                 New-SettingsUsageRow $sectionParent $dialog.Tag 'Reserve' 'codex.reserve' @('weekly')
                 if (Test-CodexProPlan $state.gpt.plan) {
-                    $dialog.Tag.UsageItems['codex.5h'].Text = '5h (Pro 숨김)'
+                    $dialog.Tag.UsageItems['codex.5h'].AccessibleDescription = 'Pro 계정에서는 5h를 숨깁니다.'
                     $dialog.Tag.UsageItems['codex.5h'].Enabled = $false
                 }
             }
             'Antigravity' {
                 New-SettingsUsageRow $sectionParent $dialog.Tag 'Gemini' 'antigravity.gemini' @('5h', 'weekly')
                 $check = New-SettingsCheck $sectionParent 'Claude (GPT 공용)' (Test-UsageItemVisible 'antigravity.claude')
-                $check.Margin = [System.Windows.Forms.Padding]::new(24, 3, 0, 5)
+                $check.Margin = [System.Windows.Forms.Padding]::new(12, 0, 0, 0)
                 $dialog.Tag.UsageItems['antigravity.claude'] = $check
                 $models = @(@($state.antigravity.rows | Where-Object {
                     $choice = Get-AntigravityChoiceKey ([string]$_.modelKey)
@@ -2069,7 +2305,7 @@ function New-SettingsDialog {
                 foreach ($model in $models) {
                     $visible = -not $script:antigravityModelVisibility.ContainsKey([string]$model) -or $script:antigravityModelVisibility[[string]$model]
                     $check = New-SettingsCheck $sectionParent $model $visible
-                    $check.Margin = [System.Windows.Forms.Padding]::new(24, 3, 0, 5)
+                    $check.Margin = [System.Windows.Forms.Padding]::new(12, 0, 0, 0)
                     $dialog.Tag.Models[[string]$model] = $check
                 }
             }
@@ -2079,15 +2315,31 @@ function New-SettingsDialog {
             }
             'CLI 연동' {
                 $hint = [TraySettings.Label]::new()
-                $hint.Text = '아래 연동 설정은 즉시 적용되며 취소해도 유지됩니다.'
-                $hint.AutoSize = $true; $hint.Margin = [System.Windows.Forms.Padding]::new(0, 0, 0, 5)
+                $hint.Text = '연동은 즉시 적용되며, 취소해도 유지됩니다.'
+                $hint.Font = $fontSettingsSmall; $hint.ForeColor = [System.Drawing.Color]::Black
+                $hint.AutoSize = $true; $hint.Margin = [System.Windows.Forms.Padding]::new(0, 0, 0, 3)
                 $sectionParent.Controls.Add($hint)
+                $dialog.Tag.CliButtons = @()
                 foreach ($provider in 'Claude', 'Antigravity') {
-                    $button = [TraySettings.Button]::new()
-                    $button.Text = "$provider 상태줄 연동 설정"; $button.Tag = $provider; $button.AutoSize = $true
-                    $button.Margin = [System.Windows.Forms.Padding]::new(0, 3, 0, 5)
-                    $button.add_Click({ param($sender, $eventArgs); Install-UsageStatusLine ([string]$sender.Tag) })
-                    $sectionParent.Controls.Add($button)
+                    $row = [System.Windows.Forms.Panel]::new()
+                    $row.Height = 40; $row.Margin = [System.Windows.Forms.Padding]::Empty
+                    $name = [TraySettings.Label]::new()
+                    $name.Text = $provider; $name.Dock = 'Fill'; $name.TextAlign = 'MiddleLeft'
+                    $buttons = [System.Windows.Forms.FlowLayoutPanel]::new()
+                    $buttons.Dock = 'Right'; $buttons.Width = 208; $buttons.WrapContents = $false
+                    foreach ($remove in @($false, $true)) {
+                        $button = [TraySettings.Button]::new()
+                        $button.Text = if ($remove) { '연동해제' } else { '연동설정' }
+                        $button.AccessibleName = "$provider $($button.Text)"
+                        $button.Tag = @{Provider=$provider;Remove=$remove}
+                        $button.Size = [System.Drawing.Size]::new(96, 36)
+                        $button.Margin = [System.Windows.Forms.Padding]::new(8, 2, 0, 2)
+                        $button.add_Click({ param($sender, $eventArgs); Set-UsageStatusLine $sender.Tag.Provider -Remove:$sender.Tag.Remove -Owner $sender.FindForm() })
+                        $buttons.Controls.Add($button)
+                        $dialog.Tag.CliButtons += $button
+                    }
+                    $row.Controls.AddRange(@($name, $buttons))
+                    $sectionParent.Controls.Add($row)
                 }
             }
         }
@@ -2106,17 +2358,17 @@ function New-SettingsDialog {
         catch {
             $settingsForm.Tag.Status.ForeColor = [System.Drawing.Color]::Firebrick
             $settingsForm.Tag.Status.Text = '저장 또는 재시작에 실패했습니다. ' + $_.Exception.Message
+            $settingsForm.Tag.Footer.Height = [Math]::Max($settingsForm.Tag.Footer.Height, $settingsForm.Tag.Status.GetPreferredSize([System.Drawing.Size]::new($settingsForm.Tag.Status.Width, 0)).Height + $settingsForm.Tag.Footer.Padding.Vertical)
             $sender.Enabled = $true
         }
     })
     $dialog.ResumeLayout($true)
     # HWND를 이 DPI 문맥에서 만든 뒤 호출자의 문맥을 복원한다. 자식 컨트롤은 창의 DPI를 상속한다.
     $null = $dialog.Handle
-    # 컨트롤을 전부 만든 뒤 한 번만 확대한다. 생성 중 자동 확대가 섞이면 고정 높이가 중복 확대된다.
-    $dialog.AutoScaleDimensions = [System.Drawing.SizeF]::new(96, 96)
-    $dialog.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
-    $dialog.PerformAutoScale()
-    $content.add_SizeChanged({ param($sender, $eventArgs); Update-SettingsLayout ($sender.FindForm()) })
+    # HWND의 실제 배율로 한 번만 확대한다. SystemAware 창의 DeviceDpi는 96으로 남을 수 있다.
+    $settingsScale = [Math]::Max(96, [Win32.Native]::GetDpiForWindow($dialog.Handle)) / 96.0
+    $dialog.Scale([System.Drawing.SizeF]::new($settingsScale, $settingsScale))
+    $content.add_ClientSizeChanged({ param($sender, $eventArgs); Update-SettingsLayout ($sender.FindForm()) })
     $workArea = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea
     Set-SettingsWindowBounds $dialog $workArea
     return $dialog
@@ -2149,49 +2401,41 @@ function Show-SettingsDialog {
 # ---------- Antigravity(Gemini) 연동 ----------
 # Antigravity CLI 는 상태줄 명령에 사용량 JSON 을 넘겨준다. 그 명령을 이 저장소의
 # antigravity-statusline.ps1 로 등록해 두면 Gemini 항목이 캐시에 쌓인다.
-function Install-UsageStatusLine([string]$provider) {
+function Show-UsageStatusLineHelp($owner) {
+    $helpText = @'
+CLI가 전달하는 사용량을 저장해, 직접 조회가 어려울 때
+마지막 사용량을 표시하기 위한 선택 기능입니다.
+
+Claude: Claude Code의 상태줄에서 사용량을 받습니다.
+Antigravity: CLI 사용량을 받습니다. 데스크톱 자동 조회만
+사용한다면 이 연동을 설정하지 않아도 됩니다.
+Codex: 앱 서버로 자동 조회하므로 연동 버튼이 없습니다.
+
+연동설정: 기존 상태줄 경로를 현재 앱 경로로 교체합니다.
+연동해제: 이 앱이 등록한 상태줄 항목을 삭제합니다.
+변경 후 실행 중인 CLI를 다시 시작하면 적용됩니다.
+
+연동 변경은 즉시 저장됩니다. 설정 창에서 취소해도 유지되며,
+해제해도 계정별 마지막 사용량 기록은 남습니다.
+'@
+    [System.Windows.Forms.MessageBox]::Show($owner, $helpText, 'CLI 연동 도움말', 'OK', 'Information') | Out-Null
+}
+
+function Set-UsageStatusLine([ValidateSet('Claude', 'Antigravity')][string]$provider, [switch]$Remove, $Owner) {
     $isClaude = $provider -eq 'Claude'
     $settings = if ($isClaude) { Join-Path (Get-ClaudeProfile) 'settings.json' }
         else { Join-Path $HOME '.gemini\antigravity-cli\settings.json' }
     $scriptName = if ($isClaude) { 'claude-statusline.ps1' } else { 'antigravity-statusline.ps1' }
     $callback = Join-Path $PSScriptRoot $scriptName
-    if (-not (Test-Path -LiteralPath $callback -PathType Leaf)) {
-        [System.Windows.Forms.MessageBox]::Show("$scriptName 파일이 없습니다.", 'AI 사용량', 'OK', 'Error') | Out-Null
-        return
-    }
-    if (-not (Test-Path -LiteralPath (Split-Path -Parent $settings))) {
-        [System.Windows.Forms.MessageBox]::Show("$provider CLI를 설치하고 로그인한 뒤 다시 시도하세요.", 'AI 사용량', 'OK', 'Warning') | Out-Null
-        return
-    }
-    $command = Get-StatusLineCommand $callback
     try {
-        $exists = Test-Path -LiteralPath $settings
-        $json = if ($exists) { Get-Content -LiteralPath $settings -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
-        $previous = $json.statusLine
-        if ($previous.command -and $previous.command -ne $command) {
-            $answer = [System.Windows.Forms.MessageBox]::Show(
-                "기존 상태줄 명령을 사용량 연동으로 바꿀까요? 기존 설정은 별도 백업에 보존됩니다.",
-                'AI 사용량', 'YesNo', 'Question')
-            if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-        }
-        if ($exists) {
-            $backup = $settings + '.ai-usage-tray.' + (Get-Date).ToString('yyyyMMddHHmmssfff') + '.bak'
-            Copy-Item -LiteralPath $settings -Destination $backup -ErrorAction Stop
-        }
-        $statusLine = if ($previous) { $previous } else { [pscustomobject]@{} }
-        $statusLine | Add-Member -NotePropertyName type -NotePropertyValue 'command' -Force
-        $statusLine | Add-Member -NotePropertyName command -NotePropertyValue $command -Force
-        if (-not $isClaude) {
-            $statusLine | Add-Member -NotePropertyName enabled -NotePropertyValue $true -Force
-            $statusLine | Add-Member -NotePropertyName stack_with_default -NotePropertyValue $true -Force
-        }
-        $json | Add-Member -NotePropertyName statusLine -NotePropertyValue $statusLine -Force
-        Set-JsonAtomic $json $settings 50
-        [System.Windows.Forms.MessageBox]::Show(
-            "$provider CLI를 다시 실행하고 한 번 사용하면 요금제·사용량이 갱신됩니다.", 'AI 사용량', 'OK', 'Information') | Out-Null
+        $changed = Write-UsageStatusLineSettings $settings $callback $isClaude -Remove:$Remove
+        $message = if (-not $changed) { "$provider CLI에 이 앱의 연동 경로가 등록되어 있지 않습니다." }
+            elseif ($Remove) { "$provider 연동 경로를 삭제했습니다. 실행 중인 CLI를 다시 시작하면 해제됩니다." }
+            else { "$provider 연동 경로를 현재 앱으로 설정했습니다. CLI를 다시 시작하고 사용하면 사용량이 갱신됩니다." }
+        [System.Windows.Forms.MessageBox]::Show($Owner, $message, 'AI 사용량', 'OK', 'Information') | Out-Null
     }
     catch {
-        [System.Windows.Forms.MessageBox]::Show('설정을 저장하지 못했습니다. 파일 접근 권한과 JSON 형식을 확인하세요.', 'AI 사용량', 'OK', 'Error') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show($Owner, '연동 설정을 변경하지 못했습니다. CLI 설치, 파일 접근 권한과 JSON 형식을 확인하세요.', 'AI 사용량', 'OK', 'Error') | Out-Null
     }
 }
 

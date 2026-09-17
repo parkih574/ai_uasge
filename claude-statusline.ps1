@@ -19,6 +19,6 @@ try {
     $usageSnapshot | Add-Member -NotePropertyName account -NotePropertyValue $account.account
     $usageSnapshot | Add-Member -NotePropertyName plan -NotePropertyValue $account.plan
     $usageSnapshot | Add-Member -NotePropertyName profile -NotePropertyValue (Get-ClaudeProfile)
-    Set-JsonAtomic $usageSnapshot $CLAUDE_STATUS_CACHE
+    Save-UsageCache $usageSnapshot $CLAUDE_STATUS_CACHE
 }
 catch { exit 1 }
