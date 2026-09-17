@@ -1,0 +1,17 @@
+# Local development output and internal progress notes
+/work/
+/docs/exec-plans/
+
+# Local settings, caches, and credentials
+.env
+.env.*
+*credentials*.json
+auth.json
+*-cache.json
+display-state.json
+
+# Temporary build output
+*.log
+*.tmp
+*.bak
+/.AiUsageTray.*.exe
